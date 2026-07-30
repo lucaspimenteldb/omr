@@ -1,0 +1,5 @@
+# Só para testes e manutenção do template — não vai para produção.
+-r requirements.txt
+pytest==9.1.1
+httpx==0.28.1        # TestClient do FastAPI (tests/test_api.py)
+pymupdf==1.28.0      # rasteriza o PDF oficial (tools/calibrar_template.py --render)

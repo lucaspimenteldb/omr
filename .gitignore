@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+
+# saídas geradas — dá para refazer com make_test_images.py / test_cli.py --debug
+debug/
+test_images/sinteticas/

@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Testa o OMR a partir de arquivos de imagem, sem precisar subir a API.
+Lê fotos de gabarito direto do disco, sem subir a API.
 
-Uso:
-    python test_cli.py samples/gabarito_matematica.png
-    python test_cli.py foto1.jpg foto2.jpg --debug
-    python test_cli.py test_images/*.png --json
+    python test_cli.py foto.jpg                    # descobre o fluxo sozinho
+    python test_cli.py foto.jpg --fluxo objetiva   # força o fluxo
+    python test_cli.py *.jpg --debug               # salva a foto anotada em debug/
+    python test_cli.py foto.jpg --json             # JSON bruto (scripts / conferência)
 
-Opções:
-    --debug   salva em debug/<nome>_debug.png uma imagem anotada (bolhas + status)
-    --json    imprime o resultado bruto em JSON (útil para conferência/scripts)
+Fluxos:
+    objetiva  -> página 1: nº do aluno + Linguagens (1..25) e Matemática (1..26)
+    redacao   -> página 2: nº do aluno + quadro de correção do professor
 """
 import argparse
 import json
@@ -18,59 +18,107 @@ import sys
 
 import cv2
 
-from omr import engine, OMRError
+from omr import FLUXOS, OMRError, ler_arquivo, ler_fluxo
+from omr import template as T
 
 STATUS_LABEL = {
-    "OK": "OK      ",
+    "OK": "OK       ",
     "BLANK": "EM BRANCO",
     "MULTIPLE": "MULTIPLA ",
     "REVIEW": "REVISAR  ",
 }
 
 
-def print_report(name, result):
-    s = result["summary"]
-    print(f"\n=== {name} ===")
-    print(f"{result['num_questions']} questões | "
-          f"OK={s['ok']}  branco={s['blank']}  múltipla={s['multiple']}  revisar={s['review']}")
-    print("-" * 58)
-    for r in result["results"]:
-        ans = r["answer"] or "-"
-        fills = " ".join(f"{k}:{v:>5.1f}" for k, v in r["fills"].items())
-        print(f"Q{r['question']:>2}  {STATUS_LABEL[r['status']]}  resp={ans:<2}  [{fills}]")
+def _linha_fills(fills: dict) -> str:
+    return " ".join(f"{k}:{v:>5.1f}" for k, v in fills.items())
 
 
-def main():
+def _imprimir_numero(num: dict) -> None:
+    valor = num["value"] or f"(indefinido: {num['raw']})"
+    print(f"Número do aluno: {valor}   [{num['status']}]")
+    for d in num["digits"]:
+        if d["status"] not in ("OK", "BLANK"):
+            print(f"   casa {d['position']:>2}  {STATUS_LABEL[d['status']]}  [{_linha_fills(d['fills'])}]")
+
+
+def imprimir(nome: str, res: dict) -> None:
+    a = res["alignment"]
+    print(f"\n=== {nome} — fluxo {res['flow']} ===")
+    print(f"registro: {a['fiducials']} | cobertura {a['coverage']:.0%} | "
+          f"rotação {a['rotation']}° | ajuste {a['global_fit']}")
+    _imprimir_numero(res["student_number"])
+
+    if res["flow"] == "objetiva":
+        for sec in res["sections"]:
+            s = sec["summary"]
+            print(f"\n-- {sec['name'].upper()} ({sec['num_questions']} questões)  "
+                  f"OK={s['ok']} branco={s['blank']} múltipla={s['multiple']} revisar={s['review']}")
+            for r in sec["results"]:
+                print(f"Q{r['question']:>2}  {STATUS_LABEL[r['status']]}  "
+                      f"resp={r['answer'] or '-':<2} [{_linha_fills(r['fills'])}]")
+    else:
+        print("\n-- CORREÇÃO")
+        for chave in T.ORDEM_CORRECAO:
+            c = res["correction"][chave]
+            print(f"{chave:16s} {STATUS_LABEL[c['status']]}  valor={c['value'] or '-':<2} "
+                  f"[{_linha_fills(c['fills'])}]")
+
+    s = res["summary"]
+    print(f"\nresumo: OK={s['ok']} branco={s['blank']} múltipla={s['multiple']} revisar={s['review']}")
+
+
+def detectar_fluxo(imagem):
+    """Tenta a objetiva; se a folha for a outra página, cai para a redação.
+
+    Devolve (fluxo, resultado_ja_calculado_ou_None) para não ler duas vezes.
+    """
+    try:
+        return "objetiva", ler_fluxo("objetiva", imagem)
+    except OMRError:
+        return "redacao", None
+
+
+def main() -> None:
     ap = argparse.ArgumentParser(description="Leitor OMR de gabaritos (offline).")
-    ap.add_argument("images", nargs="+", help="uma ou mais imagens de gabarito")
-    ap.add_argument("--debug", action="store_true", help="salva imagem anotada em debug/")
-    ap.add_argument("--json", action="store_true", help="imprime JSON bruto")
+    ap.add_argument("imagens", nargs="+", help="uma ou mais fotos da folha")
+    ap.add_argument("--fluxo", choices=sorted(FLUXOS) + ["auto"], default="auto",
+                    help="qual página está sendo lida (padrão: descobre sozinho)")
+    ap.add_argument("--debug", action="store_true", help="salva a foto anotada em debug/")
+    ap.add_argument("--json", action="store_true", help="imprime o JSON bruto")
     args = ap.parse_args()
 
-    os.makedirs("debug", exist_ok=True)
-    exit_code = 0
+    if args.debug:
+        os.makedirs("debug", exist_ok=True)
+    codigo = 0
 
-    for path in args.images:
+    for caminho in args.imagens:
+        destino = None
         try:
-            if args.debug:
-                result, dbg = engine.read_image_file(path, draw_debug=True)
-                out = os.path.join("debug", os.path.splitext(os.path.basename(path))[0] + "_debug.png")
-                cv2.imwrite(out, dbg)
+            imagem = ler_arquivo(caminho)
+            if args.fluxo == "auto":
+                fluxo, res = detectar_fluxo(imagem)
             else:
-                result = engine.read_image_file(path)
+                fluxo, res = args.fluxo, None
+            if args.debug:
+                res, anotada = ler_fluxo(fluxo, imagem, debug=True)
+                destino = os.path.join(
+                    "debug", os.path.splitext(os.path.basename(caminho))[0] + "_debug.png")
+                cv2.imwrite(destino, anotada)
+            elif res is None:
+                res = ler_fluxo(fluxo, imagem)
         except OMRError as e:
-            print(f"\n=== {path} ===\n[ERRO] {e}", file=sys.stderr)
-            exit_code = 1
+            print(f"\n=== {caminho} ===\n[ERRO] {e}", file=sys.stderr)
+            codigo = 1
             continue
 
         if args.json:
-            print(json.dumps({"file": path, **result}, ensure_ascii=False, indent=2))
+            print(json.dumps({"file": caminho, **res}, ensure_ascii=False, indent=2))
         else:
-            print_report(os.path.basename(path), result)
-            if args.debug:
-                print(f"   (debug salvo em {out})")
+            imprimir(os.path.basename(caminho), res)
+            if destino:
+                print(f"   (debug salvo em {destino})")
 
-    sys.exit(exit_code)
+    sys.exit(codigo)
 
 
 if __name__ == "__main__":

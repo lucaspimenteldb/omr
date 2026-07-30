@@ -1,118 +1,234 @@
-# OMR Backend — Leitor de Gabaritos (OpenCV)
+# OMR Backend — Leitor do Cartão-Resposta Veloz (Anos Finais)
 
-Backend em Python + OpenCV para ler as respostas marcadas por alunos em folhas
-de gabarito, a partir de uma **foto**. Calibrado para a folha modelo de
-**16 questões, 2 colunas, alternativas A/B/C/D**.
+Backend em Python + OpenCV que lê, **a partir de uma foto**, as marcações da
+folha *Cartão-Resposta Veloz — Anos Finais* (Editora Veloz).
 
-Foco em precisão nos 3 cenários:
+A folha tem duas páginas e o backend expõe **um fluxo por página**, cada um no
+seu endpoint, e cada um recebendo a **folha inteira** fotografada:
 
-| Cenário na folha | Status retornado |
+| Fluxo | Endpoint | Página | O que devolve |
+|---|---|---|---|
+| Objetiva | `POST /omr/objetiva` | 1 — *CARTÃO-RESPOSTA* | número do aluno + Linguagens (1–25) + Matemática (1–26) |
+| Redação | `POST /omr/redacao` | 2 — *PRODUÇÃO DE TEXTO* | número do aluno + quadro de correção (situação + competências 01–05) |
+
+A perspectiva é corrigida pelos **4 marcadores fiduciais** impressos nos cantos
+da folha, então a foto pode estar torta, inclinada ou tirada de lado.
+
+## Status por campo
+
+| Situação na folha | Status |
 |---|---|
-| Nenhuma alternativa marcada | `BLANK` |
-| Mais de uma alternativa marcada | `MULTIPLE` |
-| Exatamente uma marcada | `OK` (com `answer`) |
-| Preenchimento ambíguo (borrão/rasura) | `REVIEW` (conferir manualmente) |
+| Exatamente uma bolha marcada | `OK` (com `answer` / `value`) |
+| Nenhuma marcada | `BLANK` |
+| Duas ou mais marcadas | `MULTIPLE` |
+| Preenchimento ambíguo (borrão, rasura) | `REVIEW` — conferir a olho |
 
 ## Como funciona
 
-1. Detecta os 2 boxes de coluna na foto (contornos retangulares grandes).
-2. Retifica cada box com *perspective warp* (corrige inclinação/ângulo da foto).
-3. Binariza (Otsu) e mede o **% de preenchimento** de cada bolha usando uma
-   grade fixa calibrada (`omr/config.py`).
-4. Classifica cada questão. Calibração medida na folha real: bolha vazia ≤ 31 %,
-   bolha marcada ≥ 97 % → limiar em **60 %** com margem de ~66 pontos.
+```
+foto  ─▶ 1. acha o papel na cena (maior quadrilátero) e retifica grosseiro
+      ─▶ 2. acha as 4 marcas fiduciais por template matching multiescala
+      ─▶ 3. homografia → "folha canônica" (1700 px de largura entre fiduciais)
+      ─▶ 4. por bloco: reancora a grade nas bolhas realmente impressas
+      ─▶ 5. mede o % de preenchimento de cada bolha e classifica
+```
+
+Cada etapa tolera a falha da anterior: se o papel não for identificável a foto
+inteira é tratada como a folha; se só 3 marcas forem achadas, a 4ª é inferida
+por paralelogramo; se nenhuma for achada, cai para os cantos do papel. O erro
+residual que sobrar é absorvido no passo 4, que **reancora a grade nas bolhas
+reais** (ajuste afim global + deslocamento local por bloco) em vez de confiar
+cegamente em coordenadas fixas.
+
+A geometria da folha mora em [omr/template.py](omr/template.py), em coordenadas
+normalizadas pelo retângulo dos 4 fiduciais — independente de DPI, de tamanho da
+foto e de quanta margem de papel apareceu. Os números foram **medidos** no PDF
+oficial: o resíduo do ajuste de grade é < 0,1 px, ou seja, a folha é uma grade
+perfeitamente regular.
 
 ## Instalação
 
 ```bash
 cd omr-backend
 python3.12 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -r requirements.txt          # produção
+.venv/bin/pip install -r requirements-dev.txt      # + testes e calibração
 ```
 
-## Uso 1 — Script CLI (fotos de teste)
-
-```bash
-.venv/bin/python test_cli.py samples/gabarito_matematica.png
-.venv/bin/python test_cli.py minha_foto.jpg --debug   # salva imagem anotada em debug/
-.venv/bin/python test_cli.py *.jpg --json             # saída JSON bruta
-```
-
-## Uso 2 — API (Postman) — recomendado
+## Uso 1 — API (Postman / app)
 
 ```bash
 .venv/bin/uvicorn app:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Endpoints:
-
 | Método | Rota | Descrição |
 |---|---|---|
-| GET | `/health` | status do serviço |
-| POST | `/omr` | recebe a foto (form-data, campo **`file`**) → JSON com as marcações |
-| POST | `/omr/debug` | mesma coisa, mas devolve a **imagem anotada** (PNG) para conferência |
-| GET | `/docs` | Swagger UI — dá para testar pelo navegador, sem Postman |
+| `GET` | `/health` | status do serviço e o que cada fluxo devolve |
+| `POST` | `/omr/objetiva` | foto da página 1 → JSON com nº do aluno e as respostas |
+| `POST` | `/omr/objetiva/debug` | o mesmo, devolvendo a **foto anotada** (PNG) |
+| `POST` | `/omr/redacao` | foto da página 2 → JSON com nº do aluno e a correção |
+| `POST` | `/omr/redacao/debug` | o mesmo, devolvendo a **foto anotada** (PNG) |
+| `GET` | `/docs` | Swagger UI — dá para testar pelo navegador |
 
-### No Postman
-1. `POST http://localhost:8000/omr`
-2. Aba **Body** → **form-data**
-3. Key = `file`, tipo **File**, e selecione a foto do gabarito.
-4. **Send**.
+No Postman: `POST http://localhost:8000/omr/objetiva` → aba **Body** →
+**form-data** → key `file` do tipo **File** → escolha a foto → **Send**.
 
-### Exemplo de resposta
+> Mandou a página errada? O endpoint recusa com `422` e diz qual usar, em vez de
+> devolver números sem sentido.
 
-```json
-{
-  "filename": "foto.jpg",
-  "num_questions": 16,
-  "results": [
-    {"question": 1, "answer": "D", "status": "OK",
-     "marked": ["D"], "fills": {"A":14.7,"B":14.3,"C":10.8,"D":100.0}},
-    {"question": 2, "answer": null, "status": "MULTIPLE",
-     "marked": ["A","B"], "fills": {"A":100.0,"B":100.0,"C":12.0,"D":16.3}}
+### Resposta — `/omr/objetiva`
+
+```jsonc
+{~
+  "filename": "folha.jpg",
+  "flow": "objetiva",
+  "student_number": {
+    "value": "1207",              // null se não der para afirmar
+    "raw": "______1207",          // 10 casas: dígito, "_" em branco, "?" ambígua
+    "status": "OK",
+    "digits": [ { "position": 7, "digit": "1", "status": "OK",
+                  "marked": ["1"], "fills": { "0": 11.2, "1": 99.8 } } ]
+  },
+  "sections": [
+    { "name": "linguagens", "num_questions": 25,
+      "summary": { "ok": 24, "blank": 1, "multiple": 0, "review": 0 },
+      "results": [ { "question": 1, "answer": "D", "status": "OK",
+                     "marked": ["D"],
+                     "fills": { "A": 12.1, "B": 10.4, "C": 11.7, "D": 99.6 } } ] },
+    { "name": "matematica", "num_questions": 26, "summary": {}, "results": [] }
   ],
-  "summary": {"ok": 15, "blank": 0, "multiple": 1, "review": 0}
+  "summary": { "ok": 49, "blank": 1, "multiple": 1, "review": 0 },
+  "alignment": { "fiducials": "fiduciais", "coverage": 0.98, "rotation": 0 }
 }
 ```
 
-O campo **`fills`** (0–100) mostra o quão preenchida cada bolha ficou — é a sua
-base de conferência: dá para ver exatamente por que cada questão foi classificada.
+### Resposta — `/omr/redacao`
 
-## Calibração / ajustes
+```jsonc
+{
+  "filename": "redacao.jpg",
+  "flow": "redacao",
+  "student_number": { "value": "1207", "raw": "______1207", "status": "OK", "digits": [] },
+  "correction": {
+    "situacao":       { "value": "C", "status": "OK", "marked": ["C"], "fills": {} },
+    "competencia_01": { "value": "3", "status": "OK", "marked": ["3"],
+                        "fills": {}, "level": 3 },
+    "competencia_02": {}, "competencia_03": {}, "competencia_04": {}, "competencia_05": {}
+  },
+  "summary": { "ok": 5, "blank": 1, "multiple": 0, "review": 0 },
+  "alignment": { "fiducials": "fiduciais", "coverage": 0.97, "rotation": 0 }
+}
+```
 
-Tudo o que depende do layout da folha está em **`omr/config.py`**:
+`situacao` é uma letra `A`–`E`; as competências são `"0"`–`"4"` em `value` e o
+mesmo valor como inteiro em `level` (`null` quando o status não é `OK`).
 
-- `COL_X`, `ROW_Y` — centros das bolhas no box canônico;
-- `MARK_THRESHOLD` — a partir de quanto uma bolha conta como marcada (padrão 60 %);
-- `REVIEW_LOW` — piso da zona ambígua (→ status `REVIEW`);
-- `QUESTIONS_PER_BOX`, `NUM_BOXES` — geometria da folha.
+### O campo `fills` e o campo `alignment`
 
-Se a impressão da folha mudar, rode com `--debug` e ajuste `COL_X`/`ROW_Y`.
+- **`fills`** (0–100) é o quanto cada bolha ficou preenchida. É a base de
+  conferência: dá para ver exatamente por que cada campo foi classificado assim.
+- **`alignment`** conta como o registro correu — de onde vieram os fiduciais,
+  quanto da grade foi reconhecida (`coverage`), quanto a foto precisou ser
+  girada (`rotation`, em graus) e o modo de alinhamento de cada bloco. Cobertura
+  baixa é o sinal de "peça outra foto".
+
+**Orientação é resolvida sozinha.** A folha pode vir em pé, deitada (90°/270°)
+ou de ponta-cabeça: o motor testa as quatro orientações e fica com a que
+reconhece mais bolhas do template. A foto em pé custa uma tentativa só — as
+outras três só rodam se a primeira não fechar.
+
+## Uso 2 — CLI (sem subir a API)
+
+```bash
+.venv/bin/python test_cli.py foto.jpg                    # descobre o fluxo sozinho
+.venv/bin/python test_cli.py foto.jpg --fluxo redacao    # força o fluxo
+.venv/bin/python test_cli.py *.jpg --debug               # salva a foto anotada em debug/
+.venv/bin/python test_cli.py foto.jpg --json             # JSON bruto
+```
+
+A foto anotada (`--debug` ou `/omr/<fluxo>/debug`) mostra, sobre a sua própria
+foto: **verde** = bolha lida como marcada, **cinza** = vazia, **laranja** =
+ambígua, e uma **moldura magenta** ligando os 4 fiduciais como o motor os
+entendeu. É a forma mais rápida de conferir se a grade caiu no lugar certo.
+
+## Testes
+
+```bash
+.venv/bin/python -m pytest -q          # 42 testes
+```
+
+Sem acervo de fotos reais anotadas, a validação usa **fotos sintéticas**: o PDF
+oficial é renderizado, bolhas são pintadas em posições escolhidas por nós e a
+imagem é degradada como uma foto de celular degrada — perspectiva, sombra,
+desfoque, ruído e JPEG. Como o gabarito é conhecido por construção, a comparação
+é exata.
+
+```bash
+.venv/bin/python make_test_images.py   # gera as fotos em test_images/sinteticas/
+```
+
+Os testes **não** dependem desses arquivos (geram tudo em memória, com sementes
+fixas); o que fica em disco serve para conferir na mão e no Postman.
+
+Cobertura atual: as 6 fotos sintéticas (fácil/médio/difícil × 2 fluxos) leem
+**100 % dos campos**, incluindo número do aluno, questões em branco e questões
+com marcação dupla. Num teste de estresse com 30 fotos aleatórias (perspectiva
+até 5,5 %, sombra até 55 %, JPEG até qualidade 62), **855 campos comparados, 0
+divergência**.
+
+## Calibração / manutenção do template
+
+Tudo o que depende do desenho da folha está em
+[omr/template.py](omr/template.py); os limiares e parâmetros de imagem estão em
+[omr/config.py](omr/config.py).
+
+Se a Editora reimprimir a folha com qualquer mudança de layout:
+
+```bash
+# rederiva a geometria do PDF novo e compara com o template atual
+.venv/bin/python tools/calibrar_template.py --render --pdf "folha nova.pdf"
+```
+
+A ferramenta mede os fiduciais e todos os círculos impressos, ajusta uma grade a
+cada bloco e imprime as constantes prontas para colar no template — junto com o
+resíduo do ajuste. O teste `test_template_bate_com_o_pdf` roda essa mesma
+comparação, então um drift silencioso quebra a suíte.
+
+Os limiares de decisão (`MARK_THRESHOLD = 55`, `REVIEW_LOW = 40`) têm folga
+medida: bolha vazia fica abaixo de ~26 % e bolha marcada acima de ~82 %.
 
 ## Estrutura
 
 ```
 omr-backend/
 ├── omr/
-│   ├── config.py        # template + limiares (calibração)
-│   └── engine.py        # pipeline OpenCV (detecção → warp → leitura)
-├── app.py               # API FastAPI
-├── test_cli.py          # teste por arquivo
-├── make_test_images.py  # gera fotos sintéticas (branco/múltipla) p/ validar
-├── samples/             # folha de referência
-├── test_images/         # imagens de teste geradas
-├── debug/               # saídas anotadas
-└── requirements.txt
+│   ├── template.py       # o modelo da folha em coordenadas normalizadas
+│   ├── registration.py   # fiduciais → homografia → folha canônica
+│   ├── engine.py         # reancoragem da grade, medição e classificação
+│   ├── flows.py          # os 2 fluxos + imagem anotada
+│   ├── config.py         # parâmetros de imagem e limiares
+│   └── utils.py          # entrada de imagem (bytes / arquivo)
+├── app.py                # API FastAPI
+├── test_cli.py           # leitura por arquivo, sem subir a API
+├── make_test_images.py   # gera as fotos sintéticas de teste
+├── tools/
+│   └── calibrar_template.py   # rederiva o template a partir do PDF
+├── tests/
+│   ├── test_leitura.py   # ponta a ponta (motor)
+│   └── test_api.py       # contrato dos endpoints
+├── samples/modelo/       # PDF oficial + renders 300 dpi (fonte da verdade)
+├── samples/legado/       # imagens do modelo ANTIGO de folha (histórico)
+└── requirements*.txt
 ```
 
-## Limitações / próximos passos
+## Limitações conhecidas
 
-- A folha **não tem marcadores de canto** (fiducial markers). A detecção usa as
-  bordas dos boxes, o que funciona bem, mas fotos muito tortas/escuras podem
-  falhar. Adicionar quadradinhos pretos nos 4 cantos deixaria a leitura ainda
-  mais robusta.
-- Marcações a lápis fraco podem cair na zona `REVIEW` — ajuste `MARK_THRESHOLD`
-  se for usar lápis em vez de caneta.
-- O template atual assume 16 questões (8 por coluna). Outros formatos: ajustar
-  `omr/config.py`.
-```
+- **Marca fraca demais pode virar `BLANK`.** A normalização de iluminação
+  (flat-field) reduz o contraste de marcas muito claras e grandes. A própria
+  folha exige caneta preta ou azul-escura e proíbe lápis — dentro dessa regra a
+  margem é grande, mas uma marca a lápis fraco pode ser subestimada. Confira o
+  `fills` quando o resultado surpreender.
+- **Uma folha por foto.** Duas folhas no mesmo enquadramento levam a detecção do
+  papel a escolher uma delas.
+- A leitura só olha as bolhas. Nome, escola, ano e turma são escritos à mão e
+  **não** são reconhecidos — o `student_number` é a única identificação lida.

@@ -1,5 +1,24 @@
 # Planos de Implementação
 
+> **HISTÓRICO (2026-07-30).** Tudo abaixo se refere ao **modelo antigo de folha**
+> (16 questões, 2 colunas, sem marcadores fiduciais). O projeto migrou para o
+> *Cartão-Resposta Veloz — Anos Finais*, com dois fluxos em endpoints separados;
+> ver o [README](../README.md). Nessa migração foram resolvidos, de uma vez, os
+> follow-ups que estavam deferidos aqui:
+>
+> - **Caminho B — marcadores fiduciais**: a folha nova tem as 4 marcas nos
+>   cantos e o registro agora é feito por elas (`omr/registration.py`);
+> - **#4 — detecção de box robusta**: não existe mais "achar o box"; a âncora são
+>   os fiduciais, com queda para os cantos do papel e depois para a foto inteira;
+> - **#5 — conjunto de teste**: `make_test_images.py` gera fotos sintéticas com
+>   gabarito conhecido (perspectiva, sombra, desfoque, ruído, JPEG), e a suíte
+>   compara campo a campo;
+> - **#3 — limiar relativo por questão**: continua **aberto**. O corte absoluto
+>   segue com folga medida (vazia < 26 %, marcada > 82 %), então não virou plano.
+>
+> `tests/test_reading.py` foi substituído por `tests/test_leitura.py` +
+> `tests/test_api.py`; as imagens do modelo antigo estão em `samples/legado/`.
+
 Gerados pela skill `improve` em 2026-07-27. Projeto sem git — o "drift check" de
 cada plano é feito comparando os excertos de "Estado atual" com o código vivo.
 

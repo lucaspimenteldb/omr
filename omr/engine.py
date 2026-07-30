@@ -1,290 +1,410 @@
 """
-Motor de OMR (Optical Mark Recognition).
+Núcleo de leitura: mede e classifica as bolhas de uma folha já registrada.
 
-Pipeline:
-  1. detecta os 2 boxes de coluna na foto (contornos retangulares grandes);
-  2. retifica (perspective warp) cada box para um retângulo canônico;
-  3. binariza cada box (Otsu global);
-  4. amostra o percentual de preenchimento de cada bolha usando a grade fixa
-     do template (config.py);
-  5. classifica cada questão em: OK / BLANK / MULTIPLE / REVIEW.
+Recebe a imagem canônica (saída de `omr/registration.py`) e um `Bloco` do
+template, e faz, para cada bloco:
 
-O foco é a precisão nos três cenários:
-  - questão SEM alternativa marcada        -> status "BLANK"
-  - questão com MAIS DE UMA marcada         -> status "MULTIPLE"
-  - questão com EXATAMENTE UMA marcada      -> status "OK" (answer = letra)
-  - qualquer bolha em zona ambígua          -> status "REVIEW" (checagem manual)
+  1. **reancora a grade nas bolhas reais.** As posições do template são só o
+     palpite inicial: dentro do recorte do bloco procuramos as bolhas
+     efetivamente impressas e casamos cada uma com a posição esperada. Um ajuste
+     afim global (com todos os blocos juntos) absorve escala/rotação residual e
+     um deslocamento local por bloco absorve a curvatura do papel;
+  2. **mede** o percentual de pixels escuros dentro de cada bolha, num disco
+     menor que o círculo impresso (para não contar o anel nem o dígito impresso);
+  3. **classifica** cada campo em OK / BLANK / MULTIPLE / REVIEW.
+
+Se o reajuste não for confiável (poucas bolhas detectadas, escala absurda), o
+bloco cai de volta para as posições do template em vez de chutar — errar por
+não-ajustar é recuperável, errar por ajustar torto não é.
 """
 from __future__ import annotations
+
+from dataclasses import dataclass, field
 
 import cv2
 import numpy as np
 
 from . import config as C
+from . import template as T
+from .registration import CANON_IMG_H, CANON_IMG_W, OMRError, para_canonico, raio_canonico
 
-
-class OMRError(Exception):
-    """Falha estrutural: não foi possível ler a folha (boxes não encontrados etc.)."""
+__all__ = [
+    "OMRError", "ResultadoCampo", "ResultadoBloco", "LeituraFolha",
+    "ler_folha", "sondar_objetiva", "centros_do_bloco",
+]
 
 
 # --------------------------------------------------------------------------- #
-# Detecção e retificação dos boxes de coluna
+# Estruturas de resultado
 # --------------------------------------------------------------------------- #
-def _order_corners(pts: np.ndarray) -> np.ndarray:
-    """Ordena 4 pontos como [top-left, top-right, bottom-right, bottom-left]."""
-    pts = pts.reshape(4, 2).astype("float32")
-    s = pts.sum(axis=1)
-    d = np.diff(pts, axis=1).ravel()
-    return np.array(
-        [pts[np.argmin(s)], pts[np.argmin(d)], pts[np.argmax(s)], pts[np.argmax(d)]],
-        dtype="float32",
+@dataclass
+class ResultadoCampo:
+    """Uma questão, um dígito do número do aluno ou uma competência."""
+
+    chave: str
+    valor: str | None
+    status: str                       # OK | BLANK | MULTIPLE | REVIEW
+    marcadas: list[str]
+    fills: dict[str, float]
+
+
+@dataclass
+class ResultadoBloco:
+    nome: str
+    campos: list[ResultadoCampo]
+    centros: np.ndarray               # (n_linhas, n_colunas, 2) em px canônicos
+    raio_px: float
+    alinhamento: str                  # "afim+local" | "afim" | "local" | "template"
+    pares: int                        # bolhas casadas com a grade
+    esperadas: int                    # bolhas que o template prevê
+
+
+@dataclass
+class LeituraFolha:
+    blocos: dict[str, ResultadoBloco]
+    ajuste_global: str                # "afim" | "identidade"
+    pares_globais: int
+    esperadas_globais: int
+    detalhes: dict = field(default_factory=dict)
+
+    @property
+    def cobertura(self) -> float:
+        """Fração das bolhas do template que foram encontradas na foto."""
+        if not self.esperadas_globais:
+            return 0.0
+        return self.pares_globais / self.esperadas_globais
+
+
+# --------------------------------------------------------------------------- #
+# Geometria dos blocos no espaço canônico
+# --------------------------------------------------------------------------- #
+def centros_do_bloco(bloco: T.Bloco) -> np.ndarray:
+    """Centros esperados (n_linhas, n_colunas, 2) em pixels canônicos."""
+    g = bloco.grade
+    pts = np.empty((g.n_linhas, g.n_colunas, 2), dtype="float64")
+    for li in range(g.n_linhas):
+        for ci in range(g.n_colunas):
+            pts[li, ci] = para_canonico(*g.centro(li, ci))
+    return pts
+
+
+def _passos_px(bloco: T.Bloco) -> tuple[float, float]:
+    """Passo horizontal e vertical do bloco, em px canônicos."""
+    g = bloco.grade
+    a = np.array(para_canonico(g.u0, g.v0))
+    du = abs(np.array(para_canonico(g.u0 + g.du, g.v0))[0] - a[0]) if g.n_colunas > 1 else 0.0
+    dv = abs(np.array(para_canonico(g.u0, g.v0 + g.dv))[1] - a[1]) if g.n_linhas > 1 else 0.0
+    return du, dv
+
+
+def _passo_minimo(bloco: T.Bloco) -> float:
+    du, dv = _passos_px(bloco)
+    vals = [p for p in (du, dv) if p > 0]
+    return min(vals) if vals else 4 * raio_canonico(bloco.grade.raio)
+
+
+# --------------------------------------------------------------------------- #
+# Pré-processamento
+# --------------------------------------------------------------------------- #
+def _flatfield(img: np.ndarray) -> np.ndarray:
+    """Divide pelo próprio borrão: mata sombra, gradiente de luz e tarja
+    colorida. Depois disso o papel fica ~255 e a tinta bem abaixo."""
+    bg = cv2.GaussianBlur(img, (0, 0), C.FLATFIELD_SIGMA)
+    return cv2.divide(img, bg, scale=255).astype("uint8")
+
+
+def _recorte(canon: np.ndarray, centros: np.ndarray, raio_px: float) -> tuple[np.ndarray, int, int]:
+    """Recorta o ROI do bloco com folga. Devolve (roi_normalizado, x0, y0)."""
+    pad = 2.5 * raio_px
+    xs, ys = centros[..., 0], centros[..., 1]
+    x0 = int(max(0, np.floor(xs.min() - pad)))
+    y0 = int(max(0, np.floor(ys.min() - pad)))
+    x1 = int(min(CANON_IMG_W, np.ceil(xs.max() + pad)))
+    y1 = int(min(CANON_IMG_H, np.ceil(ys.max() + pad)))
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        raise OMRError("Bloco fora da área útil da folha após o registro.")
+    return _flatfield(canon[y0:y1, x0:x1]), x0, y0
+
+
+def _detectar_bolhas(roi: np.ndarray, raio_px: float) -> np.ndarray:
+    """Acha candidatas a bolha no recorte já normalizado. Devolve (N, 3): x,y,r.
+
+    Combina duas máscaras porque os dois tipos de bolha aparecem diferente:
+    a vazia é um anel fino (o adaptativo pega bem) e a marcada é um disco
+    maciço (o limiar fixo pega bem; o adaptativo esvazia o miolo dela).
+    """
+    adapt = cv2.adaptiveThreshold(
+        roi, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV,
+        C.ADAPT_BLOCK, C.ADAPT_C,
     )
+    fixo = cv2.threshold(roi, C.NIVEL_TINTA, 255, cv2.THRESH_BINARY_INV)[1]
+    mask = cv2.bitwise_or(adapt, fixo)
 
+    r_min = C.RAIO_MIN_FRAC * raio_px
+    r_max = C.RAIO_MAX_FRAC * raio_px
+    area_min = 0.35 * np.pi * r_min * r_min
 
-def _find_boxes(gray: np.ndarray) -> list[np.ndarray]:
-    """Encontra os boxes de coluna e devolve seus 4 cantos, ordenados esq->dir."""
-    h, w = gray.shape
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    th = cv2.adaptiveThreshold(
-        blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 10
-    )
-    cnts, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    area_total = float(h * w)
-    boxes = []
-    for c in cnts:
+    cnts, hier = cv2.findContours(mask, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+    saida = []
+    for c, hz in zip(cnts, hier[0] if hier is not None else []):
+        if hz[3] != -1:                       # só contornos externos
+            continue
         area = cv2.contourArea(c)
-        if not (C.BOX_MIN_AREA_FRAC * area_total <= area <= C.BOX_MAX_AREA_FRAC * area_total):
-            continue
-        peri = cv2.arcLength(c, True)
-        approx = cv2.approxPolyDP(c, 0.02 * peri, True)
-        if len(approx) != 4 or not cv2.isContourConvex(approx):
-            continue
-        x, y, bw, bh = cv2.boundingRect(approx)
-        if bh < bw:  # box de coluna é "em pé" (mais alto que largo)
-            continue
-        boxes.append((area, _order_corners(approx)))
-
-    # pega os N maiores e ordena da esquerda para a direita
-    boxes.sort(key=lambda b: b[0], reverse=True)
-    boxes = [b[1] for b in boxes[: C.NUM_BOXES]]
-    if len(boxes) < C.NUM_BOXES:
-        raise OMRError(
-            f"Esperava {C.NUM_BOXES} colunas de respostas, encontrei {len(boxes)}. "
-            "Verifique se a folha inteira está enquadrada, reta e com bom contraste."
-        )
-    boxes.sort(key=lambda q: q[0][0])  # por X do canto superior-esquerdo
-    return boxes
-
-
-def _warp(gray: np.ndarray, quad: np.ndarray) -> np.ndarray:
-    dst = np.array([[0, 0], [C.GRID_W, 0], [C.GRID_W, C.GRID_H], [0, C.GRID_H]], "float32")
-    M = cv2.getPerspectiveTransform(quad, dst)
-    return cv2.warpPerspective(gray, M, (C.GRID_W, C.GRID_H))
-
-
-# --------------------------------------------------------------------------- #
-# Detecção da grade de bolhas (posições REAIS, não fixas)
-# --------------------------------------------------------------------------- #
-def _normalize_illumination(warp: np.ndarray) -> np.ndarray:
-    """Flat-field: divide a imagem por uma versão muito borrada -> remove o
-    gradiente de sombra (persiana, iluminação lateral)."""
-    bg = cv2.GaussianBlur(warp, (0, 0), C.FLATFIELD_SIGMA)
-    return cv2.divide(warp, bg, scale=255).astype("uint8")
-
-
-def _split_k(vals, k):
-    """Agrupa valores 1D em k grupos cortando nas (k-1) maiores lacunas.
-    Devolve as medianas dos grupos, ordenadas; None se houver < k valores."""
-    v = np.sort(np.asarray(vals, dtype=float))
-    if len(v) < k:
-        return None
-    cut = np.sort(np.argsort(np.diff(v))[-(k - 1):])
-    return np.array([np.median(g) for g in np.split(v, cut + 1)])
-
-
-def _linfit(centers: np.ndarray) -> np.ndarray:
-    """Regulariza para espaçamento uniforme: ajusta center[i] = a + b*i."""
-    idx = np.arange(len(centers))
-    b, a = np.polyfit(idx, centers, 1)
-    return a + b * idx
-
-
-def _detect_grid(warp: np.ndarray):
-    """Detecta as posições reais das 4 colunas e 8 linhas de bolhas dentro do
-    box já retificado. Devolve (cols[4], rows[8], raio_mediano).
-    Levanta OMRError se a grade não puder ser recuperada com confiança."""
-    norm = _normalize_illumination(warp)
-    th = cv2.adaptiveThreshold(
-        norm, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, C.ADAPT_BLOCK, C.ADAPT_C,
-    )
-    cnts, _ = cv2.findContours(th, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    cand = []
-    for c in cnts:
-        a = cv2.contourArea(c)
-        if a < 300:
+        if area < area_min:
             continue
         (cx, cy), r = cv2.minEnclosingCircle(c)
-        if not (0.66 * C.BUBBLE_R_EXPECTED <= r <= 1.55 * C.BUBBLE_R_EXPECTED):
+        if not (r_min <= r <= r_max):
             continue
-        if a / (np.pi * r * r) < 0.45:          # descarta formas não-circulares
+        peri = cv2.arcLength(c, True)
+        if peri <= 0:
             continue
-        cand.append((cx, cy, r))
-    if len(cand) < 20:
-        raise OMRError(
-            "Poucas bolhas detectadas em uma coluna; foto possivelmente fora de "
-            "foco, cortada ou com contraste ruim. Refaça a foto mais reta e nítida."
-        )
-    colc = _split_k([p[0] for p in cand], 4)
-    rowc = _split_k([p[1] for p in cand], 8)
-    if colc is None or rowc is None:
-        raise OMRError("Não foi possível separar 4 colunas / 8 linhas de bolhas.")
-    cols, rows = _linfit(colc), _linfit(rowc)
-    col_pitch = float(np.mean(np.diff(cols)))
-    row_pitch = float(np.mean(np.diff(rows)))
-    if col_pitch <= 0 or row_pitch <= 0:
-        raise OMRError("Grade degenerada (espaçamento inválido).")
-    if (np.max(np.abs(colc - cols)) > 0.30 * col_pitch or
-            np.max(np.abs(rowc - rows)) > 0.30 * row_pitch):
-        raise OMRError(
-            "Grade irregular; alinhamento não confiável. Refaça a foto mais reta."
-        )
-    rmed = float(np.median([p[2] for p in cand]))
-    return cols, rows, rmed
+        if 4 * np.pi * area / (peri * peri) < C.CIRCULARIDADE_MIN:
+            continue
+        if area / (np.pi * r * r) < C.PREENCH_CIRCULO_MIN:
+            continue
+        saida.append((cx, cy, r))
+    return np.array(saida, dtype="float64").reshape(-1, 3)
 
 
-def _measure_fills(warp: np.ndarray, cols, rows, rmed: float):
-    """% de preenchimento de cada bolha nas posições DETECTADAS. Devolve uma
-    lista de 8 linhas, cada uma com 4 valores (A, B, C, D)."""
-    binimg = cv2.threshold(
-        _normalize_illumination(warp), 0, 255,
-        cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU,
-    )[1]
-    rs = int(round(C.SAMPLE_R_FRAC * rmed))
-    mask = np.zeros((2 * rs, 2 * rs), np.uint8)
+# --------------------------------------------------------------------------- #
+# Reajuste da grade
+# --------------------------------------------------------------------------- #
+def _casar(esperados: np.ndarray, candidatas: np.ndarray, tol: float) -> tuple[np.ndarray, np.ndarray]:
+    """Casa cada posição esperada com no máximo uma candidata, do par mais
+    próximo para o mais distante. Devolve (esperados_casados, observados)."""
+    if len(esperados) == 0 or len(candidatas) == 0:
+        return np.empty((0, 2)), np.empty((0, 2))
+    d = np.linalg.norm(esperados[:, None, :] - candidatas[None, :, :2], axis=2)
+    ordem = np.dstack(np.unravel_index(np.argsort(d, axis=None), d.shape))[0]
+    usados_e: set[int] = set()
+    usados_c: set[int] = set()
+    pares = []
+    for i, j in ordem:
+        if d[i, j] > tol:
+            break
+        if i in usados_e or j in usados_c:
+            continue
+        usados_e.add(int(i))
+        usados_c.add(int(j))
+        pares.append((int(i), int(j)))
+    if not pares:
+        return np.empty((0, 2)), np.empty((0, 2))
+    ei = np.array([p[0] for p in pares])
+    cj = np.array([p[1] for p in pares])
+    return esperados[ei], candidatas[cj, :2]
+
+
+def _fit_afim(src: np.ndarray, dst: np.ndarray) -> np.ndarray | None:
+    """Mínimos quadrados de src -> dst com duas rodadas de poda de outlier."""
+    if len(src) < 6:
+        return None
+    s, d = src, dst
+    A = None
+    for _ in range(3):
+        M = np.hstack([s, np.ones((len(s), 1))])
+        sol, *_ = np.linalg.lstsq(M, d, rcond=None)
+        A = sol.T                                     # (2, 3)
+        res = np.linalg.norm(M @ sol - d, axis=1)
+        corte = max(2.5 * float(np.median(res)), 1.0)
+        manter = res <= corte
+        if manter.all() or manter.sum() < 6:
+            break
+        s, d = s[manter], d[manter]
+    return A
+
+
+def _afim_sensata(A: np.ndarray) -> bool:
+    """Rejeita ajustes que esticam, espelham ou giram demais a folha."""
+    if A is None or not np.all(np.isfinite(A)):
+        return False
+    L = A[:, :2]
+    det = float(np.linalg.det(L))
+    if det <= 0:                                      # espelhamento
+        return False
+    sx = float(np.hypot(L[0, 0], L[1, 0]))
+    sy = float(np.hypot(L[0, 1], L[1, 1]))
+    if abs(sx - 1) > C.SNAP_ESCALA_TOL or abs(sy - 1) > C.SNAP_ESCALA_TOL:
+        return False
+    # cisalhamento / rotação: colunas devem seguir quase ortogonais aos eixos
+    if abs(L[1, 0]) > 0.12 * sx or abs(L[0, 1]) > 0.12 * sy:
+        return False
+    return True
+
+
+def _aplicar_afim(A: np.ndarray, pts: np.ndarray) -> np.ndarray:
+    forma = pts.shape
+    p = pts.reshape(-1, 2)
+    out = p @ A[:, :2].T + A[:, 2]
+    return out.reshape(forma)
+
+
+# --------------------------------------------------------------------------- #
+# Medição e classificação
+# --------------------------------------------------------------------------- #
+def _medir_fills(roi: np.ndarray, centros_locais: np.ndarray, raio_px: float) -> np.ndarray:
+    """% de pixels escuros dentro de cada bolha (disco de amostragem)."""
+    rs = max(2, int(round(C.AMOSTRA_R_FRAC * raio_px)))
+    mask = np.zeros((2 * rs + 1, 2 * rs + 1), np.uint8)
     cv2.circle(mask, (rs, rs), rs, 255, -1)
-    area = cv2.countNonZero(mask)
-    grid = []
-    for ry in rows:
-        row = []
-        for cx in cols:
-            x0, y0 = int(cx - rs), int(ry - rs)
-            patch = binimg[y0 : y0 + 2 * rs, x0 : x0 + 2 * rs]
-            if patch.shape[:2] != (2 * rs, 2 * rs):
-                row.append(0.0)
-            else:
-                dark = cv2.countNonZero(cv2.bitwise_and(patch, patch, mask=mask))
-                row.append(100.0 * dark / area if area else 0.0)
-        grid.append(row)
-    return grid
+    area = int(cv2.countNonZero(mask))
+    escuro = (roi < C.NIVEL_TINTA).astype(np.uint8) * 255
+
+    h, w = roi.shape
+    saida = np.zeros(centros_locais.shape[:-1], dtype="float64")
+    it = np.ndindex(*centros_locais.shape[:-1])
+    for idx in it:
+        cx, cy = centros_locais[idx]
+        x0, y0 = int(round(cx)) - rs, int(round(cy)) - rs
+        if x0 < 0 or y0 < 0 or x0 + 2 * rs + 1 > w or y0 + 2 * rs + 1 > h:
+            saida[idx] = 0.0
+            continue
+        patch = escuro[y0 : y0 + 2 * rs + 1, x0 : x0 + 2 * rs + 1]
+        saida[idx] = 100.0 * cv2.countNonZero(cv2.bitwise_and(patch, mask)) / area
+    return saida
 
 
-def _classify(fills: dict[str, float]) -> tuple[str | None, str]:
-    """Decide (answer, status) para uma questão a partir dos 4 preenchimentos."""
-    marked = [ch for ch, f in fills.items() if f >= C.MARK_THRESHOLD]
-    uncertain = [ch for ch, f in fills.items() if C.REVIEW_LOW <= f < C.MARK_THRESHOLD]
-
-    if len(marked) >= 2:
+def _classificar(fills: dict[str, float]) -> tuple[str | None, str]:
+    """(valor, status) de um campo a partir do preenchimento de cada opção."""
+    marcadas = [k for k, f in fills.items() if f >= C.MARK_THRESHOLD]
+    ambiguas = [k for k, f in fills.items() if C.REVIEW_LOW <= f < C.MARK_THRESHOLD]
+    if len(marcadas) >= 2:
         return None, "MULTIPLE"
-    if uncertain:                       # algo entre "vazio" e "marcado": humano decide
-        return (marked[0] if marked else None), "REVIEW"
-    if len(marked) == 1:
-        return marked[0], "OK"
+    if ambiguas:
+        return (marcadas[0] if marcadas else None), "REVIEW"
+    if len(marcadas) == 1:
+        return marcadas[0], "OK"
     return None, "BLANK"
 
 
 # --------------------------------------------------------------------------- #
-# API pública
+# Leitura de um bloco
 # --------------------------------------------------------------------------- #
-def process_image(image_bgr: np.ndarray, draw_debug: bool = False) -> dict:
-    """
-    Lê uma foto do gabarito e devolve as marcações.
+@dataclass
+class _Preparo:
+    bloco: T.Bloco
+    esperados: np.ndarray             # (n_lin, n_col, 2) no canônico
+    roi: np.ndarray
+    x0: int
+    y0: int
+    candidatas: np.ndarray            # (N, 3) em coordenadas do ROI
+    raio_px: float
 
-    Retorno:
-      {
-        "num_questions": int,
-        "results": [
-          {"question": 1, "answer": "D", "status": "OK",
-           "marked": ["D"], "fills": {"A":27.1,"B":30.3,"C":18.7,"D":100.0}},
-          ...
-        ],
-        "summary": {"ok":.., "blank":.., "multiple":.., "review":..},
-      }
-    Levanta OMRError se a folha não puder ser localizada.
-    """
-    if image_bgr is None:
-        raise OMRError("Imagem inválida / não pôde ser decodificada.")
-    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
-    boxes = _find_boxes(gray)
 
-    debug_img = image_bgr.copy() if draw_debug else None
-    results = []
-    q = 1
-    for quad in boxes:
-        warp = _warp(gray, quad)
-        cols, rows, rmed = _detect_grid(warp)      # posições REAIS das bolhas
-        grid = _measure_fills(warp, cols, rows, rmed)
+def _preparar(canon: np.ndarray, bloco: T.Bloco) -> _Preparo:
+    esperados = centros_do_bloco(bloco)
+    raio_px = raio_canonico(bloco.grade.raio)
+    roi, x0, y0 = _recorte(canon, esperados, raio_px)
+    cand = _detectar_bolhas(roi, raio_px)
+    return _Preparo(bloco, esperados, roi, x0, y0, cand, raio_px)
 
-        # matriz inversa p/ desenhar debug de volta na imagem original
-        inv_M = None
-        if draw_debug:
-            dst = np.array([[0, 0], [C.GRID_W, 0], [C.GRID_W, C.GRID_H], [0, C.GRID_H]], "float32")
-            inv_M = cv2.getPerspectiveTransform(dst, quad)
 
-        for ri, ry in enumerate(rows):
-            fills = {ch: round(grid[ri][ci], 1) for ci, ch in enumerate(C.CHOICES)}
-            answer, status = _classify(fills)
-            results.append(
-                {
-                    "question": q,
-                    "answer": answer,
-                    "status": status,
-                    "marked": [ch for ch, f in fills.items() if f >= C.MARK_THRESHOLD],
-                    "fills": fills,
-                }
+def _pares_do_preparo(p: _Preparo, esperados: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Casa as candidatas do bloco com as posições esperadas (no canônico)."""
+    if len(p.candidatas) == 0:
+        return np.empty((0, 2)), np.empty((0, 2))
+    cand_canon = p.candidatas.copy()
+    cand_canon[:, 0] += p.x0
+    cand_canon[:, 1] += p.y0
+    tol = C.SNAP_TOL_FRAC * _passo_minimo(p.bloco)
+    return _casar(esperados.reshape(-1, 2), cand_canon, tol)
+
+
+def _ler_bloco(p: _Preparo, centros: np.ndarray, alinhamento: str, pares: int) -> ResultadoBloco:
+    bloco = p.bloco
+    locais = centros.copy()
+    locais[..., 0] -= p.x0
+    locais[..., 1] -= p.y0
+    fills = _medir_fills(p.roi, locais, p.raio_px)
+
+    campos: list[ResultadoCampo] = []
+    for i, chave in enumerate(bloco.chaves):
+        rotulos = bloco.rotulos_de(i)
+        celulas = bloco.celulas_do_campo(i)
+        f = {rot: round(float(fills[li, ci]), 1) for rot, (li, ci) in zip(rotulos, celulas)}
+        valor, status = _classificar(f)
+        campos.append(
+            ResultadoCampo(
+                chave=chave,
+                valor=valor,
+                status=status,
+                marcadas=[k for k, v in f.items() if v >= C.MARK_THRESHOLD],
+                fills=f,
             )
-            if draw_debug:
-                _draw_row(debug_img, inv_M, cols, ry, rmed, fills, status)
-            q += 1
-
-    summary = {
-        "ok": sum(r["status"] == "OK" for r in results),
-        "blank": sum(r["status"] == "BLANK" for r in results),
-        "multiple": sum(r["status"] == "MULTIPLE" for r in results),
-        "review": sum(r["status"] == "REVIEW" for r in results),
-    }
-    out = {"num_questions": len(results), "results": results, "summary": summary}
-    if draw_debug:
-        return out, debug_img
-    return out
+        )
+    return ResultadoBloco(
+        nome=bloco.nome,
+        campos=campos,
+        centros=centros,
+        raio_px=p.raio_px,
+        alinhamento=alinhamento,
+        pares=pares,
+        esperadas=int(np.prod(p.esperados.shape[:-1])),
+    )
 
 
-def _draw_row(img, inv_M, cols, ry, rmed, fills, status):
-    """Marca cada bolha na imagem original, nas posições DETECTADAS
-    (verde=marcada, cinza=vazia)."""
-    color_status = {
-        "OK": (0, 170, 0), "BLANK": (0, 200, 200),
-        "MULTIPLE": (0, 0, 230), "REVIEW": (0, 140, 255),
-    }[status]
-    radius = max(3, int(rmed * 1.2))
-    for ch, cx in zip(C.CHOICES, cols):
-        pt = cv2.perspectiveTransform(np.array([[[cx, ry]]], "float32"), inv_M)[0][0]
-        marked = fills[ch] >= C.MARK_THRESHOLD
-        col = (0, 170, 0) if marked else (150, 150, 150)
-        cv2.circle(img, (int(pt[0]), int(pt[1])), radius, col, 4 if marked else 2)
-    # tag de status à esquerda da 1ª bolha da linha
-    p0 = cv2.perspectiveTransform(np.array([[[cols[0] - 2 * rmed, ry]]], "float32"), inv_M)[0][0]
-    cv2.putText(img, status[:4], (int(p0[0]), int(p0[1])),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, color_status, 2, cv2.LINE_AA)
+# --------------------------------------------------------------------------- #
+# Leitura da folha inteira
+# --------------------------------------------------------------------------- #
+def ler_folha(canon: np.ndarray, folha: T.Folha) -> LeituraFolha:
+    """Lê todos os blocos de uma folha na imagem canônica."""
+    preparos = [_preparar(canon, b) for b in folha.blocos]
+
+    # --- ajuste afim global: junta os pares de TODOS os blocos ---------------
+    src_all, dst_all = [], []
+    for p in preparos:
+        e, o = _pares_do_preparo(p, p.esperados)
+        if len(e):
+            src_all.append(e)
+            dst_all.append(o)
+    A = None
+    if src_all:
+        src = np.vstack(src_all)
+        dst = np.vstack(dst_all)
+        if len(src) >= C.SNAP_MIN_PARES_PAGINA:
+            cand = _fit_afim(src, dst)
+            A = cand if _afim_sensata(cand) else None
+
+    blocos: dict[str, ResultadoBloco] = {}
+    pares_total = 0
+    esperadas_total = 0
+    for p in preparos:
+        esperados = _aplicar_afim(A, p.esperados) if A is not None else p.esperados
+        e, o = _pares_do_preparo(p, esperados)
+
+        alinhamento = "afim" if A is not None else "template"
+        centros = esperados
+        if len(e) >= C.SNAP_MIN_PARES_BLOCO:
+            desloc = np.median(o - e, axis=0)
+            limite = C.SNAP_DESLOC_MAX_FRAC * _passo_minimo(p.bloco)
+            if float(np.hypot(*desloc)) <= limite:
+                centros = esperados + desloc
+                alinhamento = "afim+local" if A is not None else "local"
+
+        res = _ler_bloco(p, centros, alinhamento, len(e))
+        blocos[p.bloco.nome] = res
+        pares_total += len(e)
+        esperadas_total += res.esperadas
+
+    return LeituraFolha(
+        blocos=blocos,
+        ajuste_global="afim" if A is not None else "identidade",
+        pares_globais=pares_total,
+        esperadas_globais=esperadas_total,
+    )
 
 
-def read_image_file(path: str, draw_debug: bool = False):
-    img = cv2.imread(path)
-    return process_image(img, draw_debug=draw_debug)
+def sondar_objetiva(canon: np.ndarray) -> int:
+    """Quantas bolhas de questão aparecem onde a página objetiva as prevê.
 
-
-def decode_and_process(image_bytes: bytes, draw_debug: bool = False):
-    arr = np.frombuffer(image_bytes, np.uint8)
-    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-    return process_image(img, draw_debug=draw_debug)
+    Serve para dois usos: distinguir a página 1 da página 2 e detectar uma foto
+    de cabeça para baixo (aí a contagem despenca).
+    """
+    total = 0
+    for bloco in (T.LINGUAGENS_B1, T.LINGUAGENS_B2, T.MATEMATICA_B1, T.MATEMATICA_B2):
+        try:
+            p = _preparar(canon, bloco)
+        except OMRError:
+            continue
+        e, _ = _pares_do_preparo(p, p.esperados)
+        total += len(e)
+    return total

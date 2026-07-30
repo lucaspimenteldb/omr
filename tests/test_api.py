@@ -1,0 +1,122 @@
+"""
+Testes da API — o contrato que o cliente (app / Postman) enxerga.
+
+Checa o caminho feliz dos dois endpoints, o formato do JSON, o endpoint de
+debug e os erros: arquivo vazio, imagem inválida e folha da página errada.
+"""
+import os
+import sys
+
+import pytest
+
+RAIZ = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, RAIZ)
+
+pytest.importorskip("httpx", reason="TestClient do FastAPI precisa de httpx")
+
+from fastapi.testclient import TestClient   # noqa: E402
+
+import make_test_images as G                # noqa: E402
+from app import app                         # noqa: E402
+from omr import template as T               # noqa: E402
+
+cliente = TestClient(app)
+
+
+@pytest.fixture(scope="module")
+def jpegs():
+    obj, gab_obj = G.gerar_objetiva("facil", 1)
+    red, gab_red = G.gerar_redacao("facil", 11)
+    return {"objetiva": (obj, gab_obj), "redacao": (red, gab_red)}
+
+
+def _post(rota, jpeg, nome="folha.jpg"):
+    return cliente.post(rota, files={"file": (nome, jpeg, "image/jpeg")})
+
+
+def test_health():
+    r = cliente.get("/health")
+    assert r.status_code == 200
+    corpo = r.json()
+    assert corpo["status"] == "ok"
+    assert corpo["fluxos"]["objetiva"]["linguagens"] == 25
+    assert corpo["fluxos"]["objetiva"]["matematica"] == 26
+    assert corpo["fluxos"]["redacao"]["campos"] == list(T.ORDEM_CORRECAO)
+
+
+def test_objetiva_contrato(jpegs):
+    jpeg, gab = jpegs["objetiva"]
+    r = _post("/omr/objetiva", jpeg)
+    assert r.status_code == 200, r.text
+    corpo = r.json()
+
+    assert corpo["filename"] == "folha.jpg"
+    assert corpo["flow"] == "objetiva"
+    assert corpo["student_number"]["value"] == gab["student_number"]
+    assert {s["name"] for s in corpo["sections"]} == {"linguagens", "matematica"}
+    assert set(corpo["summary"]) == {"ok", "blank", "multiple", "review"}
+    assert sum(corpo["summary"].values()) == 51        # 25 + 26 questões
+
+    q1 = corpo["sections"][0]["results"][0]
+    assert set(q1) == {"question", "answer", "status", "marked", "fills"}
+    assert set(q1["fills"]) == set(T.ALTERNATIVAS)
+    assert corpo["alignment"]["fiducials"] == "fiduciais"
+
+
+def test_redacao_contrato(jpegs):
+    jpeg, gab = jpegs["redacao"]
+    r = _post("/omr/redacao", jpeg, nome="redacao.jpg")
+    assert r.status_code == 200, r.text
+    corpo = r.json()
+
+    assert corpo["flow"] == "redacao"
+    assert corpo["student_number"]["value"] == gab["student_number"]
+    assert list(corpo["correction"]) == list(T.ORDEM_CORRECAO)
+
+    situacao = corpo["correction"]["situacao"]
+    assert set(situacao["fills"]) == set(T.SITUACOES)
+    assert "level" not in situacao                       # situação é letra, não nível
+
+    c1 = corpo["correction"]["competencia_01"]
+    assert set(c1["fills"]) == set(T.NIVEIS)
+    assert c1["level"] == int(c1["value"])
+
+    for chave, esperado in gab["correction"].items():
+        assert corpo["correction"][chave]["status"] == esperado["status"]
+        assert corpo["correction"][chave]["value"] == esperado["value"]
+
+
+@pytest.mark.parametrize("rota", ["/omr/objetiva/debug", "/omr/redacao/debug"])
+def test_debug_devolve_png(jpegs, rota):
+    fluxo = "objetiva" if "objetiva" in rota else "redacao"
+    r = _post(rota, jpegs[fluxo][0])
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"] == "image/png"
+    assert r.content[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_folha_trocada_devolve_422_com_dica(jpegs):
+    r = _post("/omr/redacao", jpegs["objetiva"][0])
+    assert r.status_code == 422
+    assert "/omr/objetiva" in r.json()["detail"]
+
+    r = _post("/omr/objetiva", jpegs["redacao"][0])
+    assert r.status_code == 422
+    assert "/omr/redacao" in r.json()["detail"]
+
+
+@pytest.mark.parametrize("rota", ["/omr/objetiva", "/omr/redacao"])
+def test_arquivo_vazio_e_invalido(rota):
+    assert _post(rota, b"").status_code == 422
+    assert _post(rota, b"nao sou uma imagem").status_code == 422
+
+
+@pytest.mark.parametrize("rota", ["/omr/objetiva", "/omr/redacao"])
+def test_sem_arquivo_da_422(rota):
+    assert cliente.post(rota).status_code == 422
+
+
+def test_rota_antiga_avisa_a_troca():
+    r = cliente.post("/omr", files={"file": ("x.jpg", b"x", "image/jpeg")})
+    assert r.status_code == 410
+    assert "/omr/objetiva" in r.json()["detail"]
