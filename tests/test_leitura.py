@@ -99,7 +99,7 @@ def test_folha_em_branco_nao_inventa_marcacao(pagina, folha):
     for bloco in leitura.blocos.values():
         for campo in bloco.campos:
             assert campo.status == "BLANK", f"{bloco.nome}/{campo.chave} = {campo.status}"
-            assert max(campo.fills.values()) < C.REVIEW_LOW
+            assert max(campo.fills.values()) < C.PISO_RELATIVO
 
 
 # --------------------------------------------------------------------------- #
@@ -279,6 +279,102 @@ def test_debug_devolve_imagem_do_mesmo_tamanho(fotos):
 
 
 # --------------------------------------------------------------------------- #
+# Classificação: regra absoluta + regra relativa
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("nome, fills, esperado", [
+    # o caso que motivou a regra relativa: marca fraca de verdade, vinda de um
+    # PDF real, que antes virava BLANK e perdia a resposta do aluno
+    ("marca fraca isolada",
+     {"0": 9.5, "1": 6.9, "2": 39.6, "3": 10.1, "4": 13.1,
+      "5": 9.5, "6": 12.6, "7": 7.3, "8": 15.0, "9": 13.4}, ("2", "OK", ["2"])),
+    ("marca forte", {"A": 100.0, "B": 12.0, "C": 9.0, "D": 14.0}, ("A", "OK", ["A"])),
+    # a regra absoluta tem que continuar vindo primeiro, senão a marcação dupla
+    # (que a folha manda anular) viraria uma resposta escolhida pela maior
+    ("dupla forte", {"A": 100.0, "B": 98.0, "C": 9.0, "D": 14.0},
+     (None, "MULTIPLE", ["A", "B"])),
+    ("marca forte com rasura ao lado", {"A": 100.0, "B": 45.0, "C": 9.0, "D": 14.0},
+     ("A", "REVIEW", ["A"])),
+    ("todas vazias", {"A": 11.0, "B": 15.0, "C": 9.0, "D": 14.0}, (None, "BLANK", [])),
+    ("a vazia mais escura já medida em folha real",
+     {"A": 8.2, "B": 23.3, "C": 13.7, "D": 19.7, "E": 14.7}, (None, "BLANK", [])),
+    ("logo abaixo do piso", {"A": 29.0, "B": 12.0, "C": 9.0, "D": 14.0}, (None, "BLANK", [])),
+    ("logo acima do piso", {"A": 31.0, "B": 12.0, "C": 9.0, "D": 14.0}, ("A", "OK", ["A"])),
+    # sem a exigência de vantagem, isto seria uma escolha no cara-ou-coroa
+    ("duas fracas empatadas", {"A": 38.0, "B": 34.0, "C": 9.0, "D": 14.0},
+     (None, "REVIEW", [])),
+    ("duas fracas com vantagem clara", {"A": 48.0, "B": 30.0, "C": 9.0, "D": 14.0},
+     ("A", "OK", ["A"])),
+])
+def test_classificacao(nome, fills, esperado):
+    assert E._classificar(fills) == esperado, nome
+
+
+def test_piso_por_bloco():
+    """O número do aluno tem piso próprio; o resto usa o padrão."""
+    assert C.pisos_do_bloco("numero_aluno") == (40.0, 30.0)
+    for nome in ("linguagens_b1", "matematica_b2", "correcao_g1", "bloco_inexistente"):
+        assert C.pisos_do_bloco(nome) == (C.PISO_RELATIVO, None)
+
+
+def _digito(maior, segunda=12.0):
+    f = {str(d): 5.0 for d in range(10)}
+    f["7"], f["3"] = maior, segunda
+    return f
+
+
+@pytest.mark.parametrize("maior, segunda, esperado", [
+    (45.0, 12.0, ("7", "OK")),      # passa do piso principal (40)
+    (39.6, 12.0, ("7", "OK")),      # cai no fallback (30) — o caso reportado
+    (31.0, 12.0, ("7", "OK")),      # ainda no fallback
+    (29.0, 12.0, (None, "BLANK")),  # abaixo do fallback
+    (45.0, 38.0, (None, "REVIEW")), # passa do piso mas empata: não desce degrau
+    (38.0, 34.0, (None, "REVIEW")), # empata dentro do fallback
+])
+def test_numero_aluno_dois_degraus(maior, segunda, esperado):
+    piso, fallback = C.pisos_do_bloco("numero_aluno")
+    valor, status, _ = E._classificar(_digito(maior, segunda), piso, fallback)
+    assert (valor, status) == esperado
+
+
+def test_degraus_do_numero_aluno_sao_contiguos():
+    """Registro explícito de uma consequência do desenho escolhido.
+
+    Como a exigência de VANTAGEM_RELATIVA vale nos dois degraus e as faixas
+    [40,∞) e [30,40) se encostam, o par (40, 30) decide exatamente igual a um
+    piso único de 30. O piso de 40 documenta a intenção e fica pronto para ser
+    apertado — mas hoje NÃO muda resultado nenhum. Se este teste falhar, é
+    porque alguém tornou os degraus realmente diferentes: reveja o README.
+    """
+    piso, fallback = C.pisos_do_bloco("numero_aluno")
+    for maior in np.arange(20.0, 56.0, 0.5):
+        for segunda in (5.0, 12.0, maior - 13.0, maior - 11.0):
+            f = _digito(float(maior), float(max(0.0, segunda)))
+            assert E._classificar(f, piso, fallback) == E._classificar(f, fallback, None)
+
+
+def test_marcadas_sempre_batem_com_o_valor():
+    """`marked` e `value` não podem se contradizer — o cliente usa os dois."""
+    casos = [
+        {"A": 100.0, "B": 9.0, "C": 8.0, "D": 7.0},
+        {"A": 39.6, "B": 9.0, "C": 8.0, "D": 7.0},
+        {"A": 100.0, "B": 97.0, "C": 8.0, "D": 7.0},
+        {"A": 11.0, "B": 9.0, "C": 8.0, "D": 7.0},
+        {"A": 38.0, "B": 34.0, "C": 8.0, "D": 7.0},
+    ]
+    for fills in casos:
+        valor, status, marcadas = E._classificar(fills)
+        if status == "OK":
+            assert marcadas == [valor]
+        elif status == "BLANK":
+            assert marcadas == [] and valor is None
+        elif status == "MULTIPLE":
+            assert len(marcadas) >= 2 and valor is None
+        # em REVIEW o valor pode vir preenchido (marca clara + rasura) ou não
+        if valor is not None:
+            assert valor in marcadas
+
+
+# --------------------------------------------------------------------------- #
 # Margem de decisão
 # --------------------------------------------------------------------------- #
 def test_margem_entre_bolha_vazia_e_marcada(fotos):
@@ -292,7 +388,7 @@ def test_margem_entre_bolha_vazia_e_marcada(fotos):
                 (marcadas if rotulo in campo["marked"] else vazias).append(valor)
 
     vazias, marcadas = np.array(vazias), np.array(marcadas)
-    assert vazias.max() < C.REVIEW_LOW, f"bolha vazia chegou a {vazias.max():.1f}%"
+    assert vazias.max() < C.PISO_RELATIVO, f"bolha vazia chegou a {vazias.max():.1f}%"
     assert marcadas.min() > C.MARK_THRESHOLD + 15, f"marcada mais fraca: {marcadas.min():.1f}%"
     assert marcadas.min() - vazias.max() > 40, "margem de decisão encolheu"
 

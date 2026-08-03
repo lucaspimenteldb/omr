@@ -21,7 +21,41 @@ da folha, então a foto pode estar torta, inclinada ou tirada de lado.
 | Exatamente uma bolha marcada | `OK` (com `answer` / `value`) |
 | Nenhuma marcada | `BLANK` |
 | Duas ou mais marcadas | `MULTIPLE` |
-| Preenchimento ambíguo (borrão, rasura) | `REVIEW` — conferir a olho |
+| Preenchimento ambíguo (borrão, rasura, empate técnico) | `REVIEW` — conferir a olho |
+
+### Como a decisão é tomada
+
+Duas regras, **nesta ordem** (ver `_classificar` em [omr/engine.py](omr/engine.py)):
+
+1. **Absoluta** — bolha com preenchimento ≥ `MARK_THRESHOLD` (55 %) conta como
+   marcada. É a única regra que enxerga **marcação dupla**, e por isso vem
+   primeiro: se duas bolhas foram mesmo pintadas, o campo é `MULTIPLE` e nenhum
+   critério relativo pode escolher uma delas.
+2. **Relativa** — se *nenhuma* bolha cruzou os 55 %, a mais preenchida vence,
+   desde que passe do piso **e** esteja à frente da segunda colocada por
+   `VANTAGEM_RELATIVA` (12 pontos). É o que salva a marca fraca: um traço leve
+   de 40 % contra vizinhas de 15 % é uma resposta, não uma folha em branco.
+
+Se todas ficarem abaixo do piso → `BLANK`. Se a vencedora não abrir vantagem
+sobre a segunda → `REVIEW`, porque escolher aí seria cara-ou-coroa.
+
+O piso é **por bloco** (`pisos_do_bloco` em [omr/config.py](omr/config.py)):
+
+| Bloco | Piso | Fallback |
+|---|---|---|
+| Questões e quadro de correção | 30 % | — |
+| Número do aluno | 40 % | 30 % |
+
+O número do aluno é mais rígido porque um dígito errado troca a identidade da
+prova inteira, e a coluna tem 10 opções (mais chance de vizinha suja) contra as
+4 de uma questão.
+
+> **Nota honesta sobre os dois degraus.** Como a exigência de vantagem vale nos
+> dois e as faixas `[40, ∞)` e `[30, 40)` se encostam, o par 40/30 decide hoje
+> **exatamente igual** a um piso único de 30 — o teste
+> `test_degraus_do_numero_aluno_sao_contiguos` fixa esse fato. O 40 documenta a
+> intenção e deixa o botão pronto: para apertar de verdade, suba
+> `PISO_FALLBACK_POR_BLOCO` acima de 30 ou remova o fallback.
 
 ## Como funciona
 
@@ -154,7 +188,7 @@ entendeu. É a forma mais rápida de conferir se a grade caiu no lugar certo.
 ## Testes
 
 ```bash
-.venv/bin/python -m pytest -q          # 42 testes
+.venv/bin/python -m pytest -q          # 65 testes
 ```
 
 Sem acervo de fotos reais anotadas, a validação usa **fotos sintéticas**: o PDF
@@ -194,8 +228,22 @@ cada bloco e imprime as constantes prontas para colar no template — junto com 
 resíduo do ajuste. O teste `test_template_bate_com_o_pdf` roda essa mesma
 comparação, então um drift silencioso quebra a suíte.
 
-Os limiares de decisão (`MARK_THRESHOLD = 55`, `REVIEW_LOW = 40`) têm folga
-medida: bolha vazia fica abaixo de ~26 % e bolha marcada acima de ~82 %.
+Os limiares de decisão têm folga medida. A bolha vazia mais escura já observada
+(em 4 000+ amostras, sintéticas e reais) ficou em **23,3 %**; bolha bem pintada
+fica acima de 82 %.
+
+| Constante | Valor | Folga até o dado medido |
+|---|---|---|
+| `MARK_THRESHOLD` | 55 % | 27 pontos abaixo da marca mais fraca |
+| `PISO_RELATIVO` | 30 % | ~7 pontos acima da vazia mais escura |
+| `PISO_RELATIVO_POR_BLOCO` | 40 % (nº do aluno) | ~17 pontos |
+| `PISO_FALLBACK_POR_BLOCO` | 30 % (nº do aluno) | ~7 pontos |
+| `VANTAGEM_RELATIVA` | 12 pts | entre bolhas todas vazias a diferença típica é < 10 |
+
+O `PISO_RELATIVO` é o limiar mais apertado do sistema — é o preço de capturar
+marca fraca. Se aparecerem folhas com fundo sujo ou digitalização de baixo
+contraste, é o primeiro número a revisar (e o `fills` da resposta é o dado para
+decidir).
 
 ## Estrutura
 

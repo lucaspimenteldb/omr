@@ -263,17 +263,54 @@ def _medir_fills(roi: np.ndarray, centros_locais: np.ndarray, raio_px: float) ->
     return saida
 
 
-def _classificar(fills: dict[str, float]) -> tuple[str | None, str]:
-    """(valor, status) de um campo a partir do preenchimento de cada opção."""
+def _classificar(
+    fills: dict[str, float],
+    piso: float | None = None,
+    piso_fallback: float | None = None,
+) -> tuple[str | None, str, list[str]]:
+    """(valor, status, marcadas) de um campo a partir do preenchimento das opções.
+
+    Duas regras, nesta ordem:
+
+    **Absoluta** — bolha com `fill >= MARK_THRESHOLD` conta como marcada. É ela
+    que detecta a marcação DUPLA, e por isso vem primeiro: se duas bolhas foram
+    mesmo pintadas, o campo é `MULTIPLE`, e nenhum critério relativo pode
+    escolher uma delas.
+
+    **Relativa** — se NENHUMA bolha cruzou o limiar absoluto, a mais preenchida
+    vence, desde que (a) passe de um piso e (b) esteja à frente da segunda
+    colocada por pelo menos `VANTAGEM_RELATIVA` pontos. É o que salva a marca
+    fraca: um traço leve de 40 % contra vizinhas de 15 % é uma resposta, não uma
+    folha em branco. Sem a exigência (b), duas marcas fracas e parecidas
+    virariam escolha no cara-ou-coroa; com ela, viram `REVIEW`.
+
+    O piso pode ter dois degraus (`piso` e, abaixo dele, `piso_fallback`) — é o
+    caso do número do aluno, que exige 40 % para a leitura confiante e aceita
+    até 30 % como rede. A exigência (b) vale nos dois degraus, então quem passa
+    do piso mas empata com a vizinha vira `REVIEW` em vez de descer de degrau.
+    """
+    piso = C.PISO_RELATIVO if piso is None else piso
+
     marcadas = [k for k, f in fills.items() if f >= C.MARK_THRESHOLD]
     ambiguas = [k for k, f in fills.items() if C.REVIEW_LOW <= f < C.MARK_THRESHOLD]
+
     if len(marcadas) >= 2:
-        return None, "MULTIPLE"
-    if ambiguas:
-        return (marcadas[0] if marcadas else None), "REVIEW"
+        return None, "MULTIPLE", marcadas
     if len(marcadas) == 1:
-        return marcadas[0], "OK"
-    return None, "BLANK"
+        # marca clara + outra na zona cinzenta (rasura, apagão) -> olho humano
+        return marcadas[0], ("REVIEW" if ambiguas else "OK"), marcadas
+
+    ordenado = sorted(fills.items(), key=lambda kv: kv[1], reverse=True)
+    melhor, maior = ordenado[0]
+    segunda = ordenado[1][1] if len(ordenado) > 1 else 0.0
+
+    for corte in (piso, piso_fallback):
+        if corte is None or maior < corte:
+            continue
+        if maior - segunda < C.VANTAGEM_RELATIVA:
+            return None, "REVIEW", []
+        return melhor, "OK", [melhor]
+    return None, "BLANK", []
 
 
 # --------------------------------------------------------------------------- #
@@ -316,20 +353,15 @@ def _ler_bloco(p: _Preparo, centros: np.ndarray, alinhamento: str, pares: int) -
     locais[..., 1] -= p.y0
     fills = _medir_fills(p.roi, locais, p.raio_px)
 
+    piso, piso_fallback = C.pisos_do_bloco(bloco.nome)
     campos: list[ResultadoCampo] = []
     for i, chave in enumerate(bloco.chaves):
         rotulos = bloco.rotulos_de(i)
         celulas = bloco.celulas_do_campo(i)
         f = {rot: round(float(fills[li, ci]), 1) for rot, (li, ci) in zip(rotulos, celulas)}
-        valor, status = _classificar(f)
+        valor, status, marcadas = _classificar(f, piso, piso_fallback)
         campos.append(
-            ResultadoCampo(
-                chave=chave,
-                valor=valor,
-                status=status,
-                marcadas=[k for k, v in f.items() if v >= C.MARK_THRESHOLD],
-                fills=f,
-            )
+            ResultadoCampo(chave=chave, valor=valor, status=status, marcadas=marcadas, fills=f)
         )
     return ResultadoBloco(
         nome=bloco.nome,

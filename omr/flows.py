@@ -315,10 +315,12 @@ def desenhar_debug(image_bgr: np.ndarray, reg: Registro, leitura: LeituraFolha) 
             rotulos = tpl.rotulos_de(i)
             for rot, (li, ci) in zip(rotulos, tpl.celulas_do_campo(i)):
                 cx, cy = bloco.centros[li, ci]
-                fill = campo.fills[rot]
-                if fill >= C.MARK_THRESHOLD:
+                # a cor segue a DECISÃO do motor, não o limiar absoluto: uma
+                # marca fraca escolhida pelo critério relativo tem que aparecer
+                # verde, senão a imagem de debug contradiz o JSON
+                if rot in campo.marcadas:
                     cor, esp = (0, 170, 0), max(2, int(3 * escala))
-                elif fill >= C.REVIEW_LOW:
+                elif campo.fills[rot] >= C.PISO_RELATIVO:
                     cor, esp = (0, 140, 255), max(2, int(3 * escala))
                 else:
                     cor, esp = (150, 150, 150), max(1, int(1 * escala))
