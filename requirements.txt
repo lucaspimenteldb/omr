@@ -2,6 +2,7 @@ fastapi==0.140.6
 numpy==2.5.1
 opencv-python-headless==5.0.0.93
 pillow==12.3.0
+pillow-heif==1.5.0   # HEIC/HEIF: formato padrão da câmera do iPhone
 pydantic==2.13.4
 pydantic_core==2.46.4
 python-multipart==0.0.32

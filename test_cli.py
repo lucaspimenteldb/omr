@@ -13,6 +13,8 @@ Fluxos:
 
 O MODELO da folha (Anos Iniciais x Anos Finais) é reconhecido sozinho e sai no
 cabeçalho de cada leitura.
+
+Aceita a foto no formato que a câmera gravou — inclusive .HEIC do iPhone.
 """
 import argparse
 import json

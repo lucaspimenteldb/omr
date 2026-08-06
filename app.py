@@ -21,12 +21,18 @@ Dois MODELOS de folha são atendidos e reconhecidos automaticamente:
 O modelo detectado volta no campo `model` da resposta. Se a foto for da outra
 página — ou não for reconhecida como nenhum dos modelos — o endpoint recusa com
 422 e diz o que fazer, em vez de devolver números sem sentido.
+
+A foto pode vir no formato que a câmera gravou: HEIC (padrão do iPhone), JPEG,
+PNG, WEBP, AVIF, TIFF, BMP, GIF ou JPEG 2000. Não converta antes de enviar.
+PDF não é aceito — exporte a página como imagem.
 """
 import io
 
 import cv2
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.exception_handlers import http_exception_handler
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from omr import OMRError, decodificar, ler_fluxo
 from omr import template as T
@@ -93,6 +99,36 @@ def _png(imagem) -> StreamingResponse:
     return StreamingResponse(io.BytesIO(buf.tobytes()), media_type="image/png")
 
 
+#: O que fazer quando o upload não chega como multipart válido.
+AJUDA_UPLOAD = (
+    "Envie a foto como multipart/form-data, no campo `file` do tipo File. "
+    "NÃO defina o header Content-Type na mão: quem monta o boundary é o "
+    "cliente, e um header manual sempre acaba discordando do corpo. "
+    "No Postman: aba Body > form-data, key `file` com o tipo trocado de Text "
+    "para File, e a aba Headers sem nenhum Content-Type seu. "
+    "Em JavaScript: monte um FormData e passe direto, sem headers."
+)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _erro_de_upload(request: Request, exc: StarletteHTTPException):
+    """Traduz o 400 do parser de multipart, que nunca chega ao leitor.
+
+    O Starlette levanta esse erro dentro de `Request.form()` — antes de
+    qualquer código nosso rodar — com mensagens como "Expected boundary
+    character 45, got 148 at index 2", que não dizem nada a quem está montando
+    a requisição. A causa é sempre a mesma: o corpo enviado não bate com o
+    boundary declarado no Content-Type.
+    """
+    if exc.status_code == 400 and request.url.path.startswith("/omr"):
+        return JSONResponse(
+            status_code=400,
+            content={"detail": f"O upload não chegou como multipart/form-data válido. {AJUDA_UPLOAD}",
+                     "parser": str(exc.detail)},
+        )
+    return await http_exception_handler(request, exc)
+
+
 @app.get("/health", tags=["serviço"])
 def health():
     return {
@@ -126,11 +162,15 @@ def health():
     summary="Lê a página de respostas (qualquer modelo): nº do aluno + Linguagens e Matemática",
     responses={200: {"content": {"application/json": {"example": EXEMPLO_OBJETIVA}}}},
 )
-async def omr_objetiva(file: UploadFile = File(..., description="Foto da folha inteira")):
+async def omr_objetiva(
+    file: UploadFile = File(
+        ..., description="Foto da folha inteira (HEIC do iPhone, JPG, PNG, WEBP, ...)"),
+):
     """
-    Envie a foto da FOLHA INTEIRA (com os 4 marcadores dos cantos). O modelo —
-    Anos Iniciais (21 + 22 questões) ou Anos Finais (25 + 26) — é reconhecido
-    pela geometria da folha e volta em `model`.
+    Envie a foto da FOLHA INTEIRA (com os 4 marcadores dos cantos), no formato
+    que a câmera gravou — **HEIC do iPhone serve**, assim como JPG, PNG, WEBP e
+    AVIF. O modelo — Anos Iniciais (21 + 22 questões) ou Anos Finais (25 + 26) —
+    é reconhecido pela geometria da folha e volta em `model`.
 
     Status possíveis por questão:
 
@@ -167,7 +207,10 @@ async def omr_objetiva_debug(file: UploadFile = File(...)):
     summary="Lê a página de produção de texto: nº do aluno + quadro de correção",
     responses={200: {"content": {"application/json": {"example": EXEMPLO_REDACAO}}}},
 )
-async def omr_redacao(file: UploadFile = File(..., description="Foto da folha inteira")):
+async def omr_redacao(
+    file: UploadFile = File(
+        ..., description="Foto da folha inteira (HEIC do iPhone, JPG, PNG, WEBP, ...)"),
+):
     """
     Envie a foto da FOLHA INTEIRA da página de PRODUÇÃO DE TEXTO. Só o modelo
     Anos Finais tem essa página; folha de Anos Iniciais é recusada com 422.
