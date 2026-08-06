@@ -15,12 +15,18 @@ fotografada (campo `file`, multipart/form-data):
 
 Se a foto enviada for da outra página, o endpoint recusa com 422 e diz qual
 endpoint usar — em vez de devolver números sem sentido.
+
+A foto pode vir no formato que a câmera gravou: HEIC (padrão do iPhone), JPEG,
+PNG, WEBP, AVIF, TIFF, BMP, GIF ou JPEG 2000. Não converta antes de enviar.
+PDF não é aceito — exporte a página como imagem.
 """
 import io
 
 import cv2
-from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi.exception_handlers import http_exception_handler
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from omr import OMRError, decodificar, ler_fluxo
 from omr import template as T
@@ -84,6 +90,77 @@ def _png(imagem) -> StreamingResponse:
     return StreamingResponse(io.BytesIO(buf.tobytes()), media_type="image/png")
 
 
+#: O que fazer quando o upload não chega como multipart válido.
+AJUDA_UPLOAD = (
+    "Envie a foto como multipart/form-data, no campo `file` do tipo File. "
+    "NÃO defina o header Content-Type na mão: quem monta o boundary é o "
+    "cliente, e um header manual sempre acaba discordando do corpo. "
+    "No Postman: aba Body > form-data, key `file` com o tipo trocado de Text "
+    "para File, e a aba Headers sem nenhum Content-Type seu. "
+    "Em JavaScript: monte um FormData e passe direto, sem headers."
+)
+
+
+class EspiarInicioDoCorpo:
+    """Guarda os primeiros bytes do corpo para diagnosticar upload malformado.
+
+    Quando o multipart não bate, o parser do Starlette já consumiu o stream —
+    o handler de erro não tem mais como olhar o que chegou. Sem isso, o
+    diagnóstico vira adivinhação sobre o cliente. Só espia o primeiro trecho e
+    repassa tudo intacto, então não muda o caminho feliz.
+    """
+
+    LIMITE = 64
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http" or not scope.get("path", "").startswith("/omr"):
+            return await self.app(scope, receive, send)
+
+        async def espiar():
+            mensagem = await receive()
+            if mensagem["type"] == "http.request" and "inicio_do_corpo" not in scope:
+                scope["inicio_do_corpo"] = mensagem.get("body", b"")[: self.LIMITE]
+            return mensagem
+
+        await self.app(scope, espiar, send)
+
+
+app.add_middleware(EspiarInicioDoCorpo)
+
+
+@app.exception_handler(StarletteHTTPException)
+async def _erro_de_upload(request: Request, exc: StarletteHTTPException):
+    """Traduz o 400 do parser de multipart, que nunca chega ao leitor.
+
+    O Starlette levanta esse erro dentro de `Request.form()` — antes de
+    qualquer código nosso rodar — com mensagens como "Expected boundary
+    character 45, got 148 at index 2", que não dizem nada a quem está montando
+    a requisição. Esse texto só quer dizer uma coisa: o corpo que chegou não
+    começa com o `--boundary` declarado no Content-Type. O `recebido` abaixo
+    mostra o que veio de fato, que é o que identifica o cliente culpado.
+    """
+    if exc.status_code == 400 and request.url.path.startswith("/omr"):
+        inicio = request.scope.get("inicio_do_corpo", b"")
+        return JSONResponse(
+            status_code=400,
+            content={
+                "detail": f"O upload não chegou como multipart/form-data válido. {AJUDA_UPLOAD}",
+                "parser": str(exc.detail),
+                "recebido": {
+                    "content_type": request.headers.get("content-type"),
+                    "content_length": request.headers.get("content-length"),
+                    "primeiros_bytes_hex": inicio.hex(" "),
+                    "primeiros_bytes_texto": inicio.decode("latin-1", "replace"),
+                    "comeca_com_boundary": inicio.startswith(b"--"),
+                },
+            },
+        )
+    return await http_exception_handler(request, exc)
+
+
 @app.get("/health", tags=["serviço"])
 def health():
     return {
@@ -110,9 +187,14 @@ def health():
     summary="Lê a página 1: número do aluno + Linguagens (1..25) e Matemática (1..26)",
     responses={200: {"content": {"application/json": {"example": EXEMPLO_OBJETIVA}}}},
 )
-async def omr_objetiva(file: UploadFile = File(..., description="Foto da folha inteira")):
+async def omr_objetiva(
+    file: UploadFile = File(
+        ..., description="Foto da folha inteira (HEIC do iPhone, JPG, PNG, WEBP, ...)"),
+):
     """
-    Envie a foto da FOLHA INTEIRA da página 1 (com os 4 marcadores dos cantos).
+    Envie a foto da FOLHA INTEIRA da página 1 (com os 4 marcadores dos cantos),
+    no formato que a câmera gravou — **HEIC do iPhone serve**, assim como JPG,
+    PNG, WEBP e AVIF.
 
     Status possíveis por questão:
 
@@ -149,7 +231,10 @@ async def omr_objetiva_debug(file: UploadFile = File(...)):
     summary="Lê a página 2: número do aluno + quadro de correção do professor",
     responses={200: {"content": {"application/json": {"example": EXEMPLO_REDACAO}}}},
 )
-async def omr_redacao(file: UploadFile = File(..., description="Foto da folha inteira")):
+async def omr_redacao(
+    file: UploadFile = File(
+        ..., description="Foto da folha inteira (HEIC do iPhone, JPG, PNG, WEBP, ...)"),
+):
     """
     Envie a foto da FOLHA INTEIRA da página 2 (PRODUÇÃO DE TEXTO).
 

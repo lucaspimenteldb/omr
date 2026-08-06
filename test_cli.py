@@ -10,6 +10,8 @@ Lê fotos de gabarito direto do disco, sem subir a API.
 Fluxos:
     objetiva  -> página 1: nº do aluno + Linguagens (1..25) e Matemática (1..26)
     redacao   -> página 2: nº do aluno + quadro de correção do professor
+
+Aceita a foto no formato que a câmera gravou — inclusive .HEIC do iPhone.
 """
 import argparse
 import json

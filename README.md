@@ -105,10 +105,30 @@ python3.12 -m venv .venv
 | `GET` | `/docs` | Swagger UI — dá para testar pelo navegador |
 
 No Postman: `POST http://localhost:8000/omr/objetiva` → aba **Body** →
-**form-data** → key `file` do tipo **File** → escolha a foto → **Send**.
+**form-data** → key `file` (troque o tipo de **Text** para **File**) → escolha a
+foto → **Send**. Use a URL **sem barra no final**: `/omr/objetiva/` responde
+`307` e nem todo cliente reenvia o corpo no redirect.
+
+> **Não defina o header `Content-Type` na mão.** Quem monta o `boundary` é o
+> cliente; um header manual acaba discordando do corpo e o parser devolve
+> `400 Expected boundary character 45, got 148 at index 2`. Em JavaScript, monte
+> um `FormData` e passe direto — sem headers. Se cair nesse erro, o `400` da API
+> explica o conserto e traz a mensagem crua do parser no campo `parser`.
 
 > Mandou a página errada? O endpoint recusa com `422` e diz qual usar, em vez de
 > devolver números sem sentido.
+
+### Formatos aceitos
+
+Mande o arquivo **como a câmera gravou** — inclusive **HEIC**, o padrão do
+iPhone. Também entram JPEG, PNG, WEBP, AVIF, TIFF (até 16 bits), BMP, GIF e
+JPEG 2000. Não converta antes: a foto é decodificada direto para a matriz de
+pixels, sem passar por arquivo intermediário, então não há perda nenhuma no
+caminho — reexportar para JPEG, isso sim, custaria qualidade na borda da bolha,
+que é exatamente o que o motor mede.
+
+PDF **não** é aceito (é documento, não imagem): exporte a página como foto. O
+`422` diz isso com todas as letras em vez do genérico "formato não suportado".
 
 ### Resposta — `/omr/objetiva`
 

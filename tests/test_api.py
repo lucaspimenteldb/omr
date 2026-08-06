@@ -105,6 +105,70 @@ def test_folha_trocada_devolve_422_com_dica(jpegs):
     assert "/omr/redacao" in r.json()["detail"]
 
 
+def test_upload_heic_do_iphone(jpegs):
+    """O celular manda HEIC; o endpoint tem que aceitar como aceita JPEG."""
+    import io
+
+    import cv2
+    import numpy as np
+    from PIL import Image
+
+    from omr import decodificar
+
+    jpeg, gab = jpegs["objetiva"]
+    img = decodificar(jpeg)
+    buf = io.BytesIO()
+    Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)).save(buf, "HEIF", quality=90)
+    heic = buf.getvalue()
+    assert cv2.imdecode(np.frombuffer(heic, np.uint8), cv2.IMREAD_COLOR) is None
+
+    r = cliente.post("/omr/objetiva",
+                     files={"file": ("IMG_4821.HEIC", heic, "image/heic")})
+    assert r.status_code == 200, r.text
+    corpo = r.json()
+    assert corpo["filename"] == "IMG_4821.HEIC"
+    assert corpo["student_number"]["value"] == gab["student_number"]
+
+
+def test_upload_malformado_explica_o_que_fazer(jpegs):
+    """Corpo cru com Content-Type de multipart: o engano mais comum no Postman.
+
+    O parser do Starlette devolve "Expected boundary character 45, got 148 at
+    index 2", que não ajuda ninguém a montar a requisição direito.
+    """
+    r = cliente.post(
+        "/omr/objetiva",
+        content=jpegs["objetiva"][0],
+        headers={"Content-Type": "multipart/form-data; boundary=------------------------12345"},
+    )
+    assert r.status_code == 400
+    corpo = r.json()
+    assert "form-data" in corpo["detail"] and "Content-Type" in corpo["detail"]
+    assert corpo["parser"], "a mensagem crua do parser some do diagnóstico"
+
+    # sem isto o diagnóstico vira adivinhação sobre o cliente
+    recebido = corpo["recebido"]
+    assert recebido["comeca_com_boundary"] is False
+    assert recebido["primeiros_bytes_hex"], "o início do corpo não foi capturado"
+    assert "JFIF" in recebido["primeiros_bytes_texto"], \
+        "os bytes relatados não são os do arquivo que o cliente mandou cru"
+    assert recebido["content_type"].startswith("multipart/form-data")
+
+
+def test_multipart_sem_boundary():
+    r = cliente.post("/omr/objetiva", content=b"--X\r\n\r\n",
+                     headers={"Content-Type": "multipart/form-data"})
+    assert r.status_code == 400
+    assert "boundary" in r.json()["parser"].lower()
+
+
+def test_pdf_recebe_recado_especifico():
+    """PDF é o engano mais comum depois do HEIC — o 422 tem que dizer o que fazer."""
+    r = _post("/omr/objetiva", b"%PDF-1.7\n" + b"\x00" * 300, nome="folha.pdf")
+    assert r.status_code == 422
+    assert "PDF" in r.json()["detail"]
+
+
 @pytest.mark.parametrize("rota", ["/omr/objetiva", "/omr/redacao"])
 def test_arquivo_vazio_e_invalido(rota):
     assert _post(rota, b"").status_code == 422
