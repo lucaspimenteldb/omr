@@ -26,11 +26,15 @@ import numpy as np
 
 from . import config as C
 from . import template as T
-from .registration import CANON_IMG_H, CANON_IMG_W, OMRError, para_canonico, raio_canonico
+from .registration import (
+    CANON_IMG_H, CANON_IMG_W, CANON_MARGEM_PX, CANON_QUADRO_H,
+    OMRError, para_canonico, raio_canonico,
+)
 
 __all__ = [
     "OMRError", "ResultadoCampo", "ResultadoBloco", "LeituraFolha",
     "ler_folha", "sondar_objetiva", "centros_do_bloco",
+    "identificar_modelo", "sondar_linhas_de_resposta",
 ]
 
 
@@ -263,17 +267,54 @@ def _medir_fills(roi: np.ndarray, centros_locais: np.ndarray, raio_px: float) ->
     return saida
 
 
-def _classificar(fills: dict[str, float]) -> tuple[str | None, str]:
-    """(valor, status) de um campo a partir do preenchimento de cada opção."""
+def _classificar(
+    fills: dict[str, float],
+    piso: float | None = None,
+    piso_fallback: float | None = None,
+) -> tuple[str | None, str, list[str]]:
+    """(valor, status, marcadas) de um campo a partir do preenchimento das opções.
+
+    Duas regras, nesta ordem:
+
+    **Absoluta** — bolha com `fill >= MARK_THRESHOLD` conta como marcada. É ela
+    que detecta a marcação DUPLA, e por isso vem primeiro: se duas bolhas foram
+    mesmo pintadas, o campo é `MULTIPLE`, e nenhum critério relativo pode
+    escolher uma delas.
+
+    **Relativa** — se NENHUMA bolha cruzou o limiar absoluto, a mais preenchida
+    vence, desde que (a) passe de um piso e (b) esteja à frente da segunda
+    colocada por pelo menos `VANTAGEM_RELATIVA` pontos. É o que salva a marca
+    fraca — e a marca CIRCULADA, que nos Anos Iniciais lê 40%..54% porque a
+    caneta contorna a bolha em vez de pintá-la. Sem a exigência (b), duas
+    marcas fracas e parecidas virariam escolha no cara-ou-coroa; com ela,
+    viram `REVIEW`.
+
+    O piso pode ter dois degraus (`piso` e, abaixo dele, `piso_fallback`) — é o
+    caso do número do aluno, que exige 40% para a leitura confiante e aceita
+    até 30% como rede. A exigência (b) vale nos dois degraus.
+    """
+    piso = C.PISO_RELATIVO if piso is None else piso
+
     marcadas = [k for k, f in fills.items() if f >= C.MARK_THRESHOLD]
     ambiguas = [k for k, f in fills.items() if C.REVIEW_LOW <= f < C.MARK_THRESHOLD]
+
     if len(marcadas) >= 2:
-        return None, "MULTIPLE"
-    if ambiguas:
-        return (marcadas[0] if marcadas else None), "REVIEW"
+        return None, "MULTIPLE", marcadas
     if len(marcadas) == 1:
-        return marcadas[0], "OK"
-    return None, "BLANK"
+        # marca clara + outra na zona cinzenta (rasura, apagão) -> olho humano
+        return marcadas[0], ("REVIEW" if ambiguas else "OK"), marcadas
+
+    ordenado = sorted(fills.items(), key=lambda kv: kv[1], reverse=True)
+    melhor, maior = ordenado[0]
+    segunda = ordenado[1][1] if len(ordenado) > 1 else 0.0
+
+    for corte in (piso, piso_fallback):
+        if corte is None or maior < corte:
+            continue
+        if maior - segunda < C.VANTAGEM_RELATIVA:
+            return None, "REVIEW", []
+        return melhor, "OK", [melhor]
+    return None, "BLANK", []
 
 
 # --------------------------------------------------------------------------- #
@@ -316,20 +357,15 @@ def _ler_bloco(p: _Preparo, centros: np.ndarray, alinhamento: str, pares: int) -
     locais[..., 1] -= p.y0
     fills = _medir_fills(p.roi, locais, p.raio_px)
 
+    piso, piso_fallback = C.pisos_do_bloco(bloco.nome)
     campos: list[ResultadoCampo] = []
     for i, chave in enumerate(bloco.chaves):
         rotulos = bloco.rotulos_de(i)
         celulas = bloco.celulas_do_campo(i)
         f = {rot: round(float(fills[li, ci]), 1) for rot, (li, ci) in zip(rotulos, celulas)}
-        valor, status = _classificar(f)
+        valor, status, marcadas = _classificar(f, piso, piso_fallback)
         campos.append(
-            ResultadoCampo(
-                chave=chave,
-                valor=valor,
-                status=status,
-                marcadas=[k for k, v in f.items() if v >= C.MARK_THRESHOLD],
-                fills=f,
-            )
+            ResultadoCampo(chave=chave, valor=valor, status=status, marcadas=marcadas, fills=f)
         )
     return ResultadoBloco(
         nome=bloco.nome,
@@ -393,18 +429,143 @@ def ler_folha(canon: np.ndarray, folha: T.Folha) -> LeituraFolha:
     )
 
 
-def sondar_objetiva(canon: np.ndarray) -> int:
-    """Quantas bolhas de questão aparecem onde a página objetiva as prevê.
-
-    Serve para dois usos: distinguir a página 1 da página 2 e detectar uma foto
-    de cabeça para baixo (aí a contagem despenca).
-    """
-    total = 0
-    for bloco in (T.LINGUAGENS_B1, T.LINGUAGENS_B2, T.MATEMATICA_B1, T.MATEMATICA_B2):
-        try:
-            p = _preparar(canon, bloco)
-        except OMRError:
+# --------------------------------------------------------------------------- #
+# Identificação do modelo de folha
+# --------------------------------------------------------------------------- #
+def _regiao_de_respostas() -> tuple[float, float, float, float]:
+    """(u0, v0, u1, v1) normalizado cobrindo os blocos de questão de TODOS os
+    modelos — é onde vale a pena procurar linhas de bolha de resposta."""
+    us, vs, raio = [], [], 0.0
+    for modelo in T.MODELOS.values():
+        folha = modelo.folhas.get("objetiva")
+        if folha is None:
             continue
-        e, _ = _pares_do_preparo(p, p.esperados)
-        total += len(e)
-    return total
+        for b in folha.blocos_de_questao:
+            g = b.grade
+            us += [g.u0, g.u0 + (g.n_colunas - 1) * g.du]
+            vs += [g.v0, g.v0 + (g.n_linhas - 1) * g.dv]
+            raio = max(raio, g.raio)
+    return min(us) - 2 * raio, min(vs) - 2 * raio, max(us) + 2 * raio, max(vs) + 2 * raio
+
+
+def sondar_linhas_de_resposta(canon: np.ndarray) -> np.ndarray:
+    """`v` normalizado de cada LINHA de bolhas de resposta encontrada na folha.
+
+    Não usa template nenhum: varre a faixa onde qualquer modelo põe as questões,
+    acha as bolhas grandes e agrupa por altura. É a medida crua que serve para
+    (a) saber se a foto é a página objetiva e (b) decidir QUAL modelo é —
+    Anos Iniciais e Anos Finais têm o mesmo passo, mas começam e terminam em
+    alturas bem diferentes.
+    """
+    u0, v0, u1, v1 = _regiao_de_respostas()
+    raio_px = raio_canonico(T._RESP_RAIO)
+    x0, y0 = para_canonico(u0, v0)
+    x1, y1 = para_canonico(u1, v1)
+    x0, y0 = max(0, int(x0)), max(0, int(y0))
+    x1, y1 = min(CANON_IMG_W, int(x1)), min(CANON_IMG_H, int(y1))
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return np.empty(0)
+
+    cand = _detectar_bolhas(_flatfield(canon[y0:y1, x0:x1]), raio_px)
+    if len(cand) < 8:
+        return np.empty(0)
+
+    # agrupa por altura: uma linha de questão tem várias bolhas na mesma altura
+    passo_px = T._RESP_DV * CANON_QUADRO_H
+    ys = np.sort(cand[:, 1])
+    grupos, atual = [], [ys[0]]
+    for y in ys[1:]:
+        if y - atual[-1] <= 0.45 * passo_px:
+            atual.append(y)
+        else:
+            grupos.append(atual)
+            atual = [y]
+    grupos.append(atual)
+
+    # uma linha de verdade tem pelo menos 3 bolhas (são 16 possíveis)
+    linhas = [np.median(g) for g in grupos if len(g) >= 3]
+    if not linhas:
+        return np.empty(0)
+    return (np.array(linhas) + y0 - CANON_MARGEM_PX) / CANON_QUADRO_H
+
+
+def _custo_do_modelo(linhas_v: np.ndarray, folha: T.Folha) -> float:
+    """Quão mal as linhas observadas batem com as que a folha prevê, em passos.
+
+    Soma três desvios, todos em unidades de passo entre linhas: erro na primeira
+    linha, erro na última e diferença de contagem. Zero = encaixe perfeito.
+    Os dois modelos têm o MESMO passo, então comparar linha a linha quase empata
+    (as grades se interpenetram); o que os separa de verdade é onde o bloco
+    começa e termina — daí o custo olhar as pontas e o tamanho.
+    """
+    blocos = folha.blocos_de_questao
+    if not blocos or len(linhas_v) == 0:
+        return float("inf")
+    g = max(blocos, key=lambda b: b.grade.n_linhas).grade
+    esperado_min = g.v0
+    esperado_max = g.v0 + (g.n_linhas - 1) * g.dv
+    return (
+        abs(linhas_v.min() - esperado_min) / g.dv
+        + abs(linhas_v.max() - esperado_max) / g.dv
+        + abs(len(linhas_v) - g.n_linhas)
+    )
+
+
+#: linhas de bolha de resposta a partir das quais a folha é a página objetiva.
+#: A de redação tem 2 (as do quadro de correção); a objetiva tem 10 ou mais.
+LINHAS_MIN_OBJETIVA = 6
+
+#: custo acima disto = nenhum modelo explica a folha
+CUSTO_MAXIMO = 3.0
+#: diferença mínima entre o 1º e o 2º colocado para a escolha ser confiável
+CUSTO_MARGEM = 1.0
+
+
+def identificar_modelo(canon: np.ndarray, fluxo: str) -> tuple[T.Modelo | None, dict]:
+    """Descobre de qual modelo é a folha. Devolve (modelo, diagnóstico).
+
+    `modelo=None` significa "não dá para afirmar" — e é melhor recusar do que
+    ler com o template errado: como os dois modelos compartilham o passo, usar o
+    template errado NÃO falha ruidosamente, ele devolve respostas deslocadas uma
+    linha, que é o pior tipo de erro possível aqui.
+    """
+    candidatos = T.MODELOS_POR_FLUXO.get(fluxo, ())
+    linhas = sondar_linhas_de_resposta(canon)
+    diag = {"linhas_detectadas": len(linhas), "custos": {}}
+    if len(linhas):
+        diag["faixa"] = (round(float(linhas.min()), 4), round(float(linhas.max()), 4))
+
+    if fluxo != "objetiva":
+        # a página de redação não tem blocos de questão; se aparecerem linhas
+        # demais, veio a folha errada e é melhor recusar do que ler o quadro de
+        # correção num lugar onde ele não existe
+        if len(linhas) >= LINHAS_MIN_OBJETIVA:
+            return None, diag
+        diag["custos"] = {m.nome: 0.0 for m in candidatos}
+        return (candidatos[0] if len(candidatos) == 1 else None), diag
+
+    custos = {}
+    for m in candidatos:
+        folha = m.folhas.get(fluxo)
+        if folha is not None:
+            custos[m.nome] = round(_custo_do_modelo(linhas, folha), 3)
+    diag["custos"] = custos
+    if not custos:
+        return None, diag
+
+    ordem = sorted(custos.items(), key=lambda kv: kv[1])
+    melhor, custo = ordem[0]
+    if custo > CUSTO_MAXIMO:
+        return None, diag
+    if len(ordem) > 1 and ordem[1][1] - custo < CUSTO_MARGEM:
+        return None, diag                     # empate: recusar > adivinhar
+    return T.MODELOS[melhor], diag
+
+
+def sondar_objetiva(canon: np.ndarray) -> int:
+    """Quantas linhas de bolha de resposta a folha tem.
+
+    Serve para separar a página objetiva (dezenas) da de redação (duas, as do
+    quadro de correção), sem depender de qual modelo é.
+    """
+    return len(sondar_linhas_de_resposta(canon))

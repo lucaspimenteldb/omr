@@ -153,27 +153,44 @@ CENARIOS = {
 }
 
 
-def _abrir_modelo(pagina: int) -> np.ndarray:
-    caminho = os.path.join(MODELO, f"pagina{pagina}_300dpi.png")
+#: render limpo (300 dpi) de cada página de cada modelo, em samples/modelo/.
+RENDERS = {
+    ("anos_finais", "objetiva"): "pagina1_300dpi.png",
+    ("anos_finais", "redacao"): "pagina2_300dpi.png",
+    ("anos_iniciais", "objetiva"): "anos_iniciais_objetiva_300dpi.png",
+}
+
+
+def _abrir_modelo(modelo: str, fluxo: str = "objetiva") -> np.ndarray:
+    """Render limpo do PDF oficial. Levanta se o modelo ainda não foi rasterizado."""
+    nome = RENDERS.get((modelo, fluxo))
+    if nome is None:
+        raise SystemExit(f"não há render de referência para {modelo}/{fluxo}")
+    caminho = os.path.join(MODELO, nome)
     img = cv2.imread(caminho)
     if img is None:
         raise SystemExit(
-            f"{caminho} não encontrado — rode `python tools/calibrar_template.py --render`"
+            f"{caminho} não encontrado — rasterize o PDF oficial com:\n"
+            f"  python tools/calibrar_template.py --render --pdf ARQUIVO.pdf "
+            f"--modelo {modelo}"
         )
     return img
 
 
-def gerar_objetiva(cenario: str, semente: int) -> tuple[bytes, dict]:
+def gerar_objetiva(cenario: str, semente: int, modelo: str = "anos_finais") -> tuple[bytes, dict]:
     rng = np.random.default_rng(semente)
-    img = _abrir_modelo(1)
+    img = _abrir_modelo(modelo)
+    folha = T.MODELOS[modelo].folhas["objetiva"]
 
     alt = "ABCD"
     gabarito = {"student_number": _numero(img, "1207", rng),
-                "linguagens": {}, "matematica": {}}
+                "modelo": modelo, "linguagens": {}, "matematica": {}}
 
-    especiais = {("linguagens", 7): "BLANK", ("linguagens", 20): "MULTIPLE",
-                 ("matematica", 3): "MULTIPLE", ("matematica", 26): "BLANK"}
-    for area, blocos in T.AREAS.items():
+    n_ling = sum(b.grade.n_linhas for b in folha.areas["linguagens"])
+    n_mat = sum(b.grade.n_linhas for b in folha.areas["matematica"])
+    especiais = {("linguagens", 7): "BLANK", ("linguagens", n_ling - 5): "MULTIPLE",
+                 ("matematica", 3): "MULTIPLE", ("matematica", n_mat): "BLANK"}
+    for area, blocos in folha.areas.items():
         for bloco in blocos:
             for i, chave in enumerate(bloco.chaves):
                 q = int(chave)
@@ -193,11 +210,12 @@ def gerar_objetiva(cenario: str, semente: int) -> tuple[bytes, dict]:
     return simular_foto(img, rng, **CENARIOS[cenario]), gabarito
 
 
-def gerar_redacao(cenario: str, semente: int) -> tuple[bytes, dict]:
+def gerar_redacao(cenario: str, semente: int, modelo: str = "anos_finais") -> tuple[bytes, dict]:
     rng = np.random.default_rng(semente)
-    img = _abrir_modelo(2)
+    img = _abrir_modelo(modelo, "redacao")
 
-    gabarito = {"student_number": _numero(img, "1207", rng), "correction": {}}
+    gabarito = {"student_number": _numero(img, "1207", rng),
+                "modelo": modelo, "correction": {}}
     escolhas = {"situacao": "C", "competencia_01": "3", "competencia_02": "4",
                 "competencia_03": "0", "competencia_04": "2", "competencia_05": "1"}
     duplicar = {"competencia_04"}          # exercita o caso MULTIPLE
@@ -221,14 +239,25 @@ def gerar_redacao(cenario: str, semente: int) -> tuple[bytes, dict]:
     return simular_foto(img, rng, **CENARIOS[cenario]), gabarito
 
 
+#: (arquivo, fluxo, cenário, semente, modelo)
 CASOS = [
-    ("objetiva_facil.jpg", "objetiva", "facil", 1),
-    ("objetiva_medio.jpg", "objetiva", "medio", 2),
-    ("objetiva_dificil.jpg", "objetiva", "dificil", 3),
-    ("redacao_facil.jpg", "redacao", "facil", 11),
-    ("redacao_medio.jpg", "redacao", "medio", 12),
-    ("redacao_dificil.jpg", "redacao", "dificil", 13),
+    ("finais_objetiva_facil.jpg", "objetiva", "facil", 1, "anos_finais"),
+    ("finais_objetiva_medio.jpg", "objetiva", "medio", 2, "anos_finais"),
+    ("finais_objetiva_dificil.jpg", "objetiva", "dificil", 3, "anos_finais"),
+    ("finais_redacao_facil.jpg", "redacao", "facil", 11, "anos_finais"),
+    ("finais_redacao_medio.jpg", "redacao", "medio", 12, "anos_finais"),
+    ("finais_redacao_dificil.jpg", "redacao", "dificil", 13, "anos_finais"),
+    ("iniciais_objetiva_facil.jpg", "objetiva", "facil", 21, "anos_iniciais"),
+    ("iniciais_objetiva_medio.jpg", "objetiva", "medio", 22, "anos_iniciais"),
+    ("iniciais_objetiva_dificil.jpg", "objetiva", "dificil", 23, "anos_iniciais"),
 ]
+
+
+def caso_disponivel(caso) -> bool:
+    """O render de referência desse caso já existe em samples/modelo/?"""
+    _, fluxo, _, _, modelo = caso
+    nome = RENDERS.get((modelo, fluxo))
+    return bool(nome) and os.path.exists(os.path.join(MODELO, nome))
 
 
 def main() -> None:
@@ -237,19 +266,26 @@ def main() -> None:
     args = ap.parse_args()
 
     if args.listar:
-        for nome, fluxo, cenario, _ in CASOS:
-            print(f"{nome:24s} fluxo={fluxo:9s} cenário={cenario}")
+        for caso in CASOS:
+            nome, fluxo, cenario, _, modelo = caso
+            tem = "" if caso_disponivel(caso) else "   (sem render de referência)"
+            print(f"{nome:30s} modelo={modelo:14s} fluxo={fluxo:9s} cenário={cenario}{tem}")
         return
 
     os.makedirs(SAIDA, exist_ok=True)
     gabaritos = {}
-    for nome, fluxo, cenario, semente in CASOS:
+    for caso in CASOS:
+        nome, fluxo, cenario, semente, modelo = caso
+        if not caso_disponivel(caso):
+            print(f"{nome:30s} PULADO — falta o render de {modelo}")
+            continue
         gerar = gerar_objetiva if fluxo == "objetiva" else gerar_redacao
-        jpeg, gab = gerar(cenario, semente)
+        jpeg, gab = gerar(cenario, semente, modelo)
         destino = os.path.join(SAIDA, nome)
         with open(destino, "wb") as fh:
             fh.write(jpeg)
-        gabaritos[nome] = {"fluxo": fluxo, "cenario": cenario, "gabarito": gab}
+        gabaritos[nome] = {"fluxo": fluxo, "cenario": cenario, "modelo": modelo,
+                           "gabarito": gab}
         print(f"{destino}  ({len(jpeg) / 1024:.0f} KB, {cenario})")
 
     with open(os.path.join(SAIDA, "gabaritos.json"), "w", encoding="utf-8") as fh:

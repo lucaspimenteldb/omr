@@ -25,8 +25,8 @@ cliente = TestClient(app)
 
 @pytest.fixture(scope="module")
 def jpegs():
-    obj, gab_obj = G.gerar_objetiva("facil", 1)
-    red, gab_red = G.gerar_redacao("facil", 11)
+    obj, gab_obj = G.gerar_objetiva("facil", 1, "anos_finais")
+    red, gab_red = G.gerar_redacao("facil", 11, "anos_finais")
     return {"objetiva": (obj, gab_obj), "redacao": (red, gab_red)}
 
 
@@ -39,9 +39,12 @@ def test_health():
     assert r.status_code == 200
     corpo = r.json()
     assert corpo["status"] == "ok"
-    assert corpo["fluxos"]["objetiva"]["linguagens"] == 25
-    assert corpo["fluxos"]["objetiva"]["matematica"] == 26
-    assert corpo["fluxos"]["redacao"]["campos"] == list(T.ORDEM_CORRECAO)
+    fin = corpo["modelos"]["anos_finais"]["fluxos"]
+    ini = corpo["modelos"]["anos_iniciais"]["fluxos"]
+    assert fin["objetiva"] == {"linguagens": 25, "matematica": 26}
+    assert fin["redacao"]["campos"] == list(T.ORDEM_CORRECAO)
+    assert ini["objetiva"] == {"linguagens": 21, "matematica": 22}
+    assert "redacao" not in ini, "Anos Iniciais não tem página de redação"
 
 
 def test_objetiva_contrato(jpegs):
@@ -52,6 +55,7 @@ def test_objetiva_contrato(jpegs):
 
     assert corpo["filename"] == "folha.jpg"
     assert corpo["flow"] == "objetiva"
+    assert corpo["model"] == "anos_finais"
     assert corpo["student_number"]["value"] == gab["student_number"]
     assert {s["name"] for s in corpo["sections"]} == {"linguagens", "matematica"}
     assert set(corpo["summary"]) == {"ok", "blank", "multiple", "review"}
@@ -70,6 +74,7 @@ def test_redacao_contrato(jpegs):
     corpo = r.json()
 
     assert corpo["flow"] == "redacao"
+    assert corpo["model"] == "anos_finais"
     assert corpo["student_number"]["value"] == gab["student_number"]
     assert list(corpo["correction"]) == list(T.ORDEM_CORRECAO)
 

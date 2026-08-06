@@ -15,13 +15,20 @@ Os números abaixo foram MEDIDOS automaticamente no PDF oficial renderizado a
 ajuste linear ficou < 0,1 px em todas as grades: a folha é perfeitamente
 regular, então uma grade (origem + passo) descreve cada bloco exatamente.
 
-Duas páginas, dois fluxos:
-  - FOLHA_OBJETIVA (página 1) — Linguagens 1..25, Matemática 1..26, nº do aluno;
-  - FOLHA_REDACAO  (página 2) — quadro de correção do professor, nº do aluno.
+Dois MODELOS publicados, com a mesma geometria de base:
+
+  - MODELO_ANOS_INICIAIS — objetiva: Linguagens 1..21, Matemática 1..22.
+    Não tem página de produção de texto.
+  - MODELO_ANOS_FINAIS   — objetiva: Linguagens 1..25, Matemática 1..26;
+    redação: quadro de correção do professor.
+
+Os dois compartilham cabeçalho (nº do aluno), passo entre bolhas, raio e a
+posição horizontal dos blocos. Muda só quantas questões cada disciplina tem e,
+por causa disso, a altura em que os blocos de questão começam.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # --------------------------------------------------------------------------- #
 # Geometria do quadro fiducial
@@ -116,11 +123,39 @@ class Bloco:
 
 @dataclass(frozen=True)
 class Folha:
-    """Uma página do modelo: os blocos que devem ser lidos nela."""
+    """Uma página de um modelo: os blocos que devem ser lidos nela.
+
+    `areas` só existe na página objetiva e diz quais blocos compõem cada
+    disciplina, na ordem das questões (Linguagens = bloco 1 + bloco 2, etc.).
+    """
+
+    nome: str                                  # "objetiva" | "redacao"
+    titulo: str
+    blocos: tuple[Bloco, ...]
+    areas: dict[str, tuple[Bloco, ...]] = field(default_factory=dict)
+
+    @property
+    def blocos_de_questao(self) -> tuple[Bloco, ...]:
+        return tuple(b for blocos in self.areas.values() for b in blocos)
+
+
+@dataclass(frozen=True)
+class Modelo:
+    """Um modelo de folha da coleção (Anos Iniciais, Anos Finais, ...).
+
+    Os dois modelos publicados são a MESMA folha com contagens diferentes: o
+    cabeçalho, o passo entre bolhas, o raio e a posição horizontal dos blocos
+    são idênticos; muda só quantas questões cada disciplina tem e, por causa
+    disso, a altura em que os blocos começam. Anos Iniciais não tem a página de
+    produção de texto — por isso `folhas` é um dicionário e não um par fixo.
+    """
 
     nome: str
     titulo: str
-    blocos: tuple[Bloco, ...]
+    folhas: dict[str, Folha]
+
+    def folha(self, fluxo: str) -> Folha | None:
+        return self.folhas.get(fluxo)
 
 
 # --------------------------------------------------------------------------- #
@@ -146,22 +181,29 @@ BLOCO_NUMERO_ALUNO = Bloco(
 
 
 # --------------------------------------------------------------------------- #
-# Página 1 — CARTÃO-RESPOSTA (Linguagens 1..25, Matemática 1..26)
+# Página objetiva — CARTÃO-RESPOSTA
 # --------------------------------------------------------------------------- #
 ALTERNATIVAS = ("A", "B", "C", "D")
 
-# Todos os 4 blocos de questões começam na mesma altura e têm o mesmo passo.
-_RESP_V0 = 0.680303
-_RESP_DV = 0.024388
-_RESP_DU = 0.049740
+# Geometria COMPARTILHADA pelos dois modelos. Medida no PDF oficial dos Anos
+# Finais e reconferida no scan dos Anos Iniciais: as quatro colunas de blocos
+# caem no mesmo lugar (diferença < 1,4 px em 2386) e o passo é o mesmo.
+_RESP_DV = 0.024388                # passo entre linhas (questões)
+_RESP_DU = 0.049740                # passo entre alternativas
 _RESP_RAIO = 0.014823
+_RESP_U0 = (0.068376, 0.306551, 0.567638, 0.805821)   # 4 blocos, esq -> dir
+
+# O que MUDA de um modelo para o outro: quantas questões cada disciplina tem e,
+# como consequência do layout, a altura da primeira linha.
+_V0_ANOS_FINAIS = 0.680303         # medido no PDF oficial (resíduo < 0,1 px)
+_V0_ANOS_INICIAIS = 0.708603       # medido no scan de referência (resíduo ~1 px)
 
 
-def _bloco_questoes(nome: str, u0: float, primeira: int, n: int) -> Bloco:
+def _bloco_questoes(nome: str, u0: float, v0: float, primeira: int, n: int) -> Bloco:
     return Bloco(
         nome=nome,
         grade=Grade(
-            u0=u0, v0=_RESP_V0, du=_RESP_DU, dv=_RESP_DV,
+            u0=u0, v0=v0, du=_RESP_DU, dv=_RESP_DV,
             n_linhas=n, n_colunas=len(ALTERNATIVAS), raio=_RESP_RAIO,
         ),
         eixo="linha",
@@ -170,23 +212,24 @@ def _bloco_questoes(nome: str, u0: float, primeira: int, n: int) -> Bloco:
     )
 
 
-# Bloco 1 = questões 1..13; Bloco 2 = 14..25 (Linguagens) / 14..26 (Matemática).
-LINGUAGENS_B1 = _bloco_questoes("linguagens_b1", 0.068376, 1, 13)
-LINGUAGENS_B2 = _bloco_questoes("linguagens_b2", 0.306551, 14, 12)
-MATEMATICA_B1 = _bloco_questoes("matematica_b1", 0.567638, 1, 13)
-MATEMATICA_B2 = _bloco_questoes("matematica_b2", 0.805821, 14, 13)
+def _folha_objetiva(titulo: str, v0: float, linguagens: tuple[int, int],
+                    matematica: tuple[int, int]) -> Folha:
+    """Monta a página objetiva de um modelo.
 
-# Quais blocos compõem cada área (na ordem das questões).
-AREAS = {
-    "linguagens": (LINGUAGENS_B1, LINGUAGENS_B2),
-    "matematica": (MATEMATICA_B1, MATEMATICA_B2),
-}
-
-FOLHA_OBJETIVA = Folha(
-    nome="objetiva",
-    titulo="CARTÃO-RESPOSTA — Anos finais",
-    blocos=(BLOCO_NUMERO_ALUNO, LINGUAGENS_B1, LINGUAGENS_B2, MATEMATICA_B1, MATEMATICA_B2),
-)
+    `linguagens`/`matematica` são (nº de questões no BLOCO 1, no BLOCO 2). O
+    bloco 2 continua a numeração de onde o bloco 1 parou.
+    """
+    areas: dict[str, tuple[Bloco, ...]] = {}
+    for i, (area, (n1, n2)) in enumerate(
+        (("linguagens", linguagens), ("matematica", matematica))
+    ):
+        u_b1, u_b2 = _RESP_U0[2 * i], _RESP_U0[2 * i + 1]
+        areas[area] = (
+            _bloco_questoes(f"{area}_b1", u_b1, v0, 1, n1),
+            _bloco_questoes(f"{area}_b2", u_b2, v0, n1 + 1, n2),
+        )
+    blocos = (BLOCO_NUMERO_ALUNO,) + tuple(b for bs in areas.values() for b in bs)
+    return Folha(nome="objetiva", titulo=titulo, blocos=blocos, areas=areas)
 
 
 # --------------------------------------------------------------------------- #
@@ -250,4 +293,52 @@ FOLHA_REDACAO = Folha(
 )
 
 
+# --------------------------------------------------------------------------- #
+# Os modelos publicados
+# --------------------------------------------------------------------------- #
+MODELO_ANOS_FINAIS = Modelo(
+    nome="anos_finais",
+    titulo="Cartão-Resposta Veloz — Anos Finais",
+    folhas={
+        "objetiva": _folha_objetiva(
+            "CARTÃO-RESPOSTA — Anos finais", _V0_ANOS_FINAIS,
+            linguagens=(13, 12),      # 1..13 + 14..25 = 25 questões
+            matematica=(13, 13),      # 1..13 + 14..26 = 26 questões
+        ),
+        "redacao": FOLHA_REDACAO,
+    },
+)
+
+# Anos Iniciais não tem página de produção de texto — só a objetiva.
+MODELO_ANOS_INICIAIS = Modelo(
+    nome="anos_iniciais",
+    titulo="Cartão-Resposta Veloz — Anos Iniciais",
+    folhas={
+        "objetiva": _folha_objetiva(
+            "CARTÃO-RESPOSTA — Anos iniciais", _V0_ANOS_INICIAIS,
+            linguagens=(11, 10),      # 1..11 + 12..21 = 21 questões
+            matematica=(11, 11),      # 1..11 + 12..22 = 22 questões
+        ),
+    },
+)
+
+MODELOS = {m.nome: m for m in (MODELO_ANOS_INICIAIS, MODELO_ANOS_FINAIS)}
+
+#: Quais modelos atendem cada fluxo.
+MODELOS_POR_FLUXO = {
+    fluxo: tuple(m for m in MODELOS.values() if fluxo in m.folhas)
+    for fluxo in ("objetiva", "redacao")
+}
+
+#: Todo bloco de todos os modelos, por nome — usado para desenhar o debug.
+TODOS_OS_BLOCOS = {
+    b.nome: b
+    for m in MODELOS.values()
+    for f in m.folhas.values()
+    for b in f.blocos
+}
+
+# Compatibilidade: o modelo dos Anos Finais como estava antes do registry.
+FOLHA_OBJETIVA = MODELO_ANOS_FINAIS.folhas["objetiva"]
+AREAS = FOLHA_OBJETIVA.areas
 FOLHAS = {FOLHA_OBJETIVA.nome: FOLHA_OBJETIVA, FOLHA_REDACAO.nome: FOLHA_REDACAO}

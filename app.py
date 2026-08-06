@@ -1,5 +1,5 @@
 """
-API FastAPI do leitor de gabaritos — modelo Cartão-Resposta Veloz (Anos finais).
+API FastAPI do leitor de gabaritos — Cartão-Resposta Veloz.
 
 Subir:
     uvicorn app:app --reload --host 0.0.0.0 --port 8000
@@ -7,14 +7,20 @@ Subir:
 Dois fluxos, um por página da folha. Os dois recebem a FOLHA INTEIRA
 fotografada (campo `file`, multipart/form-data):
 
-    POST /omr/objetiva        página 1 -> nº do aluno + Linguagens + Matemática
-    POST /omr/redacao         página 2 -> nº do aluno + quadro de correção
+    POST /omr/objetiva        respostas -> nº do aluno + Linguagens + Matemática
+    POST /omr/redacao         redação   -> nº do aluno + quadro de correção
     POST /omr/<fluxo>/debug   o mesmo, devolvendo a imagem anotada (PNG)
-    GET  /health              status do serviço
+    GET  /health              status do serviço e os modelos suportados
     GET  /docs                Swagger UI
 
-Se a foto enviada for da outra página, o endpoint recusa com 422 e diz qual
-endpoint usar — em vez de devolver números sem sentido.
+Dois MODELOS de folha são atendidos e reconhecidos automaticamente:
+
+    anos_iniciais   Linguagens 1..21, Matemática 1..22   (não tem redação)
+    anos_finais     Linguagens 1..25, Matemática 1..26   (+ redação)
+
+O modelo detectado volta no campo `model` da resposta. Se a foto for da outra
+página — ou não for reconhecida como nenhum dos modelos — o endpoint recusa com
+422 e diz o que fazer, em vez de devolver números sem sentido.
 """
 import io
 
@@ -34,6 +40,8 @@ app = FastAPI(
 EXEMPLO_OBJETIVA = {
     "filename": "folha.jpg",
     "flow": "objetiva",
+    "model": "anos_finais",
+    "model_title": "Cartão-Resposta Veloz — Anos Finais",
     "student_number": {
         "value": "1207",
         "raw": "______1207",
@@ -55,6 +63,7 @@ EXEMPLO_OBJETIVA = {
 EXEMPLO_REDACAO = {
     "filename": "redacao.jpg",
     "flow": "redacao",
+    "model": "anos_finais",
     "student_number": {"value": "1207", "raw": "______1207", "status": "OK", "digits": []},
     "correction": {
         "situacao": {"value": "C", "status": "OK", "marked": ["C"],
@@ -89,15 +98,22 @@ def health():
     return {
         "status": "ok",
         "service": "omr-backend",
-        "modelo": "Cartão-Resposta Veloz — Anos finais",
-        "fluxos": {
-            "objetiva": {
-                "rota": "/omr/objetiva",
-                "linguagens": sum(b.grade.n_linhas for b in T.AREAS["linguagens"]),
-                "matematica": sum(b.grade.n_linhas for b in T.AREAS["matematica"]),
-            },
-            "redacao": {"rota": "/omr/redacao", "campos": list(T.ORDEM_CORRECAO)},
+        
+        "modelos": {
+            m.nome: {
+                "titulo": m.titulo,
+                "fluxos": {
+                    fluxo: (
+                        {area: sum(b.grade.n_linhas for b in blocos)
+                         for area, blocos in folha.areas.items()}
+                        if folha.areas else {"campos": list(T.ORDEM_CORRECAO)}
+                    )
+                    for fluxo, folha in m.folhas.items()
+                },
+            }
+            for m in T.MODELOS.values()
         },
+        "rotas": {"objetiva": "/omr/objetiva", "redacao": "/omr/redacao"},
     }
 
 
@@ -107,12 +123,14 @@ def health():
 @app.post(
     "/omr/objetiva",
     tags=["objetiva"],
-    summary="Lê a página 1: número do aluno + Linguagens (1..25) e Matemática (1..26)",
+    summary="Lê a página de respostas (qualquer modelo): nº do aluno + Linguagens e Matemática",
     responses={200: {"content": {"application/json": {"example": EXEMPLO_OBJETIVA}}}},
 )
 async def omr_objetiva(file: UploadFile = File(..., description="Foto da folha inteira")):
     """
-    Envie a foto da FOLHA INTEIRA da página 1 (com os 4 marcadores dos cantos).
+    Envie a foto da FOLHA INTEIRA (com os 4 marcadores dos cantos). O modelo —
+    Anos Iniciais (21 + 22 questões) ou Anos Finais (25 + 26) — é reconhecido
+    pela geometria da folha e volta em `model`.
 
     Status possíveis por questão:
 
@@ -146,12 +164,13 @@ async def omr_objetiva_debug(file: UploadFile = File(...)):
 @app.post(
     "/omr/redacao",
     tags=["redação"],
-    summary="Lê a página 2: número do aluno + quadro de correção do professor",
+    summary="Lê a página de produção de texto: nº do aluno + quadro de correção",
     responses={200: {"content": {"application/json": {"example": EXEMPLO_REDACAO}}}},
 )
 async def omr_redacao(file: UploadFile = File(..., description="Foto da folha inteira")):
     """
-    Envie a foto da FOLHA INTEIRA da página 2 (PRODUÇÃO DE TEXTO).
+    Envie a foto da FOLHA INTEIRA da página de PRODUÇÃO DE TEXTO. Só o modelo
+    Anos Finais tem essa página; folha de Anos Iniciais é recusada com 422.
 
     Devolve o número do aluno e os 6 campos do quadro *CORREÇÃO – uso exclusivo
     do professor avaliador*: `situacao` (A–E) e `competencia_01`..`competencia_05`

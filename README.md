@@ -1,15 +1,23 @@
-# OMR Backend — Leitor do Cartão-Resposta Veloz (Anos Finais)
+# OMR Backend — Leitor do Cartão-Resposta Veloz
 
-Backend em Python + OpenCV que lê, **a partir de uma foto**, as marcações da
-folha *Cartão-Resposta Veloz — Anos Finais* (Editora Veloz).
+Backend em Python + OpenCV que lê, **a partir de uma foto**, as marcações das
+folhas *Cartão-Resposta Veloz* (Editora Veloz).
 
-A folha tem duas páginas e o backend expõe **um fluxo por página**, cada um no
-seu endpoint, e cada um recebendo a **folha inteira** fotografada:
+**Dois fluxos**, um por página, cada um no seu endpoint e cada um recebendo a
+**folha inteira** fotografada:
 
-| Fluxo | Endpoint | Página | O que devolve |
+| Fluxo | Endpoint | O que devolve |
+|---|---|---|
+| Objetiva | `POST /omr/objetiva` | número do aluno + Linguagens + Matemática |
+| Redação | `POST /omr/redacao` | número do aluno + quadro de correção (situação + competências 01–05) |
+
+**Dois modelos de folha**, reconhecidos automaticamente — o modelo detectado
+volta no campo `model` da resposta:
+
+| Modelo | Linguagens | Matemática | Redação |
 |---|---|---|---|
-| Objetiva | `POST /omr/objetiva` | 1 — *CARTÃO-RESPOSTA* | número do aluno + Linguagens (1–25) + Matemática (1–26) |
-| Redação | `POST /omr/redacao` | 2 — *PRODUÇÃO DE TEXTO* | número do aluno + quadro de correção (situação + competências 01–05) |
+| `anos_iniciais` | 1–21 | 1–22 | — |
+| `anos_finais` | 1–25 | 1–26 | sim |
 
 A perspectiva é corrigida pelos **4 marcadores fiduciais** impressos nos cantos
 da folha, então a foto pode estar torta, inclinada ou tirada de lado.
@@ -29,9 +37,23 @@ da folha, então a foto pode estar torta, inclinada ou tirada de lado.
 foto  ─▶ 1. acha o papel na cena (maior quadrilátero) e retifica grosseiro
       ─▶ 2. acha as 4 marcas fiduciais por template matching multiescala
       ─▶ 3. homografia → "folha canônica" (1700 px de largura entre fiduciais)
-      ─▶ 4. por bloco: reancora a grade nas bolhas realmente impressas
-      ─▶ 5. mede o % de preenchimento de cada bolha e classifica
+      ─▶ 4. identifica o MODELO pela altura das linhas de questão
+      ─▶ 5. por bloco: reancora a grade nas bolhas realmente impressas
+      ─▶ 6. mede o % de preenchimento de cada bolha e classifica
 ```
+
+### Por que o passo 4 existe
+
+Os dois modelos compartilham o passo entre linhas. Ler um Anos Iniciais com o
+template de Anos Finais **não falha ruidosamente**: as grades se interpenetram e
+o resultado são respostas deslocadas uma questão — medido antes da correção,
+uma folha de Iniciais lida como Finais devolvia 37 respostas "OK", todas erradas.
+
+Por isso o modelo é decidido pela geometria **medida** das linhas de bolha
+(onde o bloco começa, onde termina, quantas linhas tem), e não pela cobertura da
+grade. Nas folhas reais o custo de encaixe fica em 0,01 para o modelo certo e
+~4,0 para o errado — margem de 400×. Empate ou custo alto → o endpoint recusa,
+porque errar o modelo é pior do que não responder.
 
 Cada etapa tolera a falha da anterior: se o papel não for identificável a foto
 inteira é tratada como a folha; se só 3 marcas forem achadas, a 4ª é inferida
@@ -82,6 +104,8 @@ No Postman: `POST http://localhost:8000/omr/objetiva` → aba **Body** →
 {~
   "filename": "folha.jpg",
   "flow": "objetiva",
+  "model": "anos_finais",          // ou "anos_iniciais" — detectado
+  "model_title": "Cartão-Resposta Veloz — Anos Finais",
   "student_number": {
     "value": "1207",              // null se não der para afirmar
     "raw": "______1207",          // 10 casas: dígito, "_" em branco, "?" ambígua
@@ -108,6 +132,7 @@ No Postman: `POST http://localhost:8000/omr/objetiva` → aba **Body** →
 {
   "filename": "redacao.jpg",
   "flow": "redacao",
+  "model": "anos_finais",
   "student_number": { "value": "1207", "raw": "______1207", "status": "OK", "digits": [] },
   "correction": {
     "situacao":       { "value": "C", "status": "OK", "marked": ["C"], "fills": {} },
@@ -129,8 +154,9 @@ mesmo valor como inteiro em `level` (`null` quando o status não é `OK`).
   conferência: dá para ver exatamente por que cada campo foi classificado assim.
 - **`alignment`** conta como o registro correu — de onde vieram os fiduciais,
   quanto da grade foi reconhecida (`coverage`), quanto a foto precisou ser
-  girada (`rotation`, em graus) e o modo de alinhamento de cada bloco. Cobertura
-  baixa é o sinal de "peça outra foto".
+  girada (`rotation`, em graus), o modo de alinhamento de cada bloco e, em
+  `model_detection`, o custo de encaixe de cada modelo. Cobertura baixa é o
+  sinal de "peça outra foto".
 
 **Orientação é resolvida sozinha.** A folha pode vir em pé, deitada (90°/270°)
 ou de ponta-cabeça: o motor testa as quatro orientações e fica com a que
@@ -154,7 +180,7 @@ entendeu. É a forma mais rápida de conferir se a grade caiu no lugar certo.
 ## Testes
 
 ```bash
-.venv/bin/python -m pytest -q          # 42 testes
+.venv/bin/python -m pytest -q          # 52 testes
 ```
 
 Sem acervo de fotos reais anotadas, a validação usa **fotos sintéticas**: o PDF
@@ -170,9 +196,10 @@ desfoque, ruído e JPEG. Como o gabarito é conhecido por construção, a compar
 Os testes **não** dependem desses arquivos (geram tudo em memória, com sementes
 fixas); o que fica em disco serve para conferir na mão e no Postman.
 
-Cobertura atual: as 6 fotos sintéticas (fácil/médio/difícil × 2 fluxos) leem
-**100 % dos campos**, incluindo número do aluno, questões em branco e questões
-com marcação dupla. Num teste de estresse com 30 fotos aleatórias (perspectiva
+Cobertura atual: as 6 fotos sintéticas de Anos Finais (fácil/médio/difícil ×
+2 fluxos) leem **100 % dos campos**. Nas folhas reais digitalizadas, a de Anos
+Iniciais lê **43/43 questões** e o número do aluno inteiro — e ela é o caso
+difícil, porque o aluno **circulou** as bolhas em vez de pintar. Num teste de estresse com 30 fotos aleatórias (perspectiva
 até 5,5 %, sombra até 55 %, JPEG até qualidade 62), **855 campos comparados, 0
 divergência**.
 
@@ -182,12 +209,21 @@ Tudo o que depende do desenho da folha está em
 [omr/template.py](omr/template.py); os limiares e parâmetros de imagem estão em
 [omr/config.py](omr/config.py).
 
-Se a Editora reimprimir a folha com qualquer mudança de layout:
+Se a Editora reimprimir a folha — ou para acrescentar um modelo novo:
 
 ```bash
-# rederiva a geometria do PDF novo e compara com o template atual
-.venv/bin/python tools/calibrar_template.py --render --pdf "folha nova.pdf"
+# rasteriza UMA página do PDF oficial, já endireitada, e mede
+.venv/bin/python tools/calibrar_template.py --render --pdf "folha.pdf" \
+    --modelo anos_iniciais --fluxo objetiva --pagina 1 --rotacao 180
+
+# só mede o que já está rasterizado e confere contra o template
+.venv/bin/python tools/calibrar_template.py --conferir
 ```
+
+`--pagina` e `--rotacao` existem porque o PDF da coleção traz várias páginas e
+algumas vêm giradas 180°; a rotação é aplicada **antes** de medir. As caixas de
+busca saem do próprio `template.py`, então o calibrador acompanha um modelo novo
+sem lista de coordenadas escrita à mão.
 
 A ferramenta mede os fiduciais e todos os círculos impressos, ajusta uma grade a
 cada bloco e imprime as constantes prontas para colar no template — junto com o

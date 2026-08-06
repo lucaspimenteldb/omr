@@ -6,14 +6,19 @@ Rederiva a geometria de `omr/template.py` a partir do PDF oficial da folha.
 qualquer mudança de layout, rode isto no PDF novo, confira os números e cole-os
 em `omr/template.py`. Nada aqui roda em produção.
 
-    # (re)gera os PNGs de referência usados pelos testes — precisa de pymupdf
-    python tools/calibrar_template.py --render --pdf "Cartão-Resposta Veloz.pdf"
+    # rasteriza o PDF oficial de um modelo (só a página que interessa)
+    python tools/calibrar_template.py --render --pdf "Anos Iniciais.pdf" \\
+           --modelo anos_iniciais --pagina 1 --rotacao 180
 
     # mede os PNGs já existentes e imprime as constantes do template
     python tools/calibrar_template.py
 
-    # confere se o template atual bate com o que está medido no PDF
+    # confere se o template atual bate com o PDF (sai != 0 se divergir)
     python tools/calibrar_template.py --conferir
+
+O PDF da coleção traz várias páginas e algumas vêm giradas 180°; por isso
+`--pagina` e `--rotacao` existem. A rotação é aplicada ANTES de qualquer
+medição — medir de cabeça para baixo espelharia todas as coordenadas.
 
 Como funciona: acha os 4 marcadores fiduciais (as únicas manchas compactas e
 quadradas nos cantos), acha todos os círculos impressos, agrupa-os em blocos e
@@ -40,17 +45,43 @@ DPI = 300
 
 
 # --------------------------------------------------------------------------- #
-def renderizar(pdf: str) -> None:
+#: nome do PNG de referência de cada (modelo, fluxo) em samples/modelo/.
+RENDERS = {
+    ("anos_finais", "objetiva"): "pagina1_300dpi.png",
+    ("anos_finais", "redacao"): "pagina2_300dpi.png",
+    ("anos_iniciais", "objetiva"): "anos_iniciais_objetiva_300dpi.png",
+}
+
+
+def renderizar(pdf: str, modelo: str, fluxo: str, pagina: int, rotacao: int) -> str:
+    """Rasteriza UMA página do PDF, já endireitada, no destino do modelo."""
     try:
         import fitz
     except ImportError:
         raise SystemExit("--render precisa do pymupdf:  pip install pymupdf")
+    nome = RENDERS.get((modelo, fluxo))
+    if nome is None:
+        raise SystemExit(f"não sei onde guardar o render de {modelo}/{fluxo}")
+
     os.makedirs(MODELO, exist_ok=True)
     doc = fitz.open(pdf)
-    for i, page in enumerate(doc):
-        destino = os.path.join(MODELO, f"pagina{i + 1}_{DPI}dpi.png")
-        page.get_pixmap(dpi=DPI).save(destino)
-        print("gerado:", destino)
+    if not 1 <= pagina <= doc.page_count:
+        raise SystemExit(f"--pagina {pagina} fora de 1..{doc.page_count}")
+    destino = os.path.join(MODELO, nome)
+
+    pix = doc[pagina - 1].get_pixmap(dpi=DPI)
+    img = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.width, pix.n)
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR if pix.n == 3 else cv2.COLOR_RGBA2BGR)
+    giro = {0: None, 90: cv2.ROTATE_90_CLOCKWISE, 180: cv2.ROTATE_180,
+            270: cv2.ROTATE_90_COUNTERCLOCKWISE}
+    if rotacao not in giro:
+        raise SystemExit("--rotacao deve ser 0, 90, 180 ou 270")
+    if giro[rotacao] is not None:
+        img = cv2.rotate(img, giro[rotacao])
+    cv2.imwrite(destino, img)
+    print(f"gerado: {destino}  ({img.shape[1]}x{img.shape[0]} px, página {pagina} "
+          f"de {doc.page_count}, girada {rotacao}°)")
+    return destino
 
 
 # --------------------------------------------------------------------------- #
@@ -122,11 +153,21 @@ def ajustar(centros: np.ndarray) -> tuple[float, float, float]:
 
 # --------------------------------------------------------------------------- #
 class Medidor:
-    def __init__(self, pagina: int):
-        caminho = os.path.join(MODELO, f"pagina{pagina}_{DPI}dpi.png")
+    """Mede um render de referência no quadro fiducial daquele render."""
+
+    def __init__(self, modelo: str, fluxo: str):
+        nome = RENDERS.get((modelo, fluxo))
+        if nome is None:
+            raise SystemExit(f"não há render previsto para {modelo}/{fluxo}")
+        caminho = os.path.join(MODELO, nome)
         img = cv2.imread(caminho, cv2.IMREAD_GRAYSCALE)
         if img is None:
-            raise SystemExit(f"{caminho} não encontrado — rode com --render primeiro")
+            raise SystemExit(
+                f"{caminho} não encontrado — rasterize primeiro:\n"
+                f"  python tools/calibrar_template.py --render --pdf ARQ.pdf "
+                f"--modelo {modelo} --fluxo {fluxo} [--pagina N] [--rotacao 180]"
+            )
+        self.modelo, self.fluxo, self.caminho = modelo, fluxo, caminho
         self.img = img
         self.fid = achar_fiduciais(img)
         self.x0, self.y0 = self.fid["TL"]
@@ -140,64 +181,61 @@ class Medidor:
     def v(self, y):
         return (y - self.y0) / self.h
 
-    def bloco(self, nome: str, caixa, tol=30) -> dict:
-        """Mede a grade dentro de (xmin, xmax, ymin, ymax) em px do render."""
-        xmin, xmax, ymin, ymax = caixa
+    def _caixa_do_bloco(self, bloco: T.Bloco, folga: float = 0.45):
+        """Onde procurar as bolhas desse bloco, em px do render.
+
+        A caixa sai do PRÓPRIO template — assim o calibrador acompanha qualquer
+        modelo novo sem lista de coordenadas escrita à mão. A folga é MEIO PASSO
+        (menos um tico): mais que isso e a caixa engole a primeira coluna do
+        bloco vizinho ou a linha de cima, e a medição sai com forma errada.
+        """
+        g = bloco.grade
+        raio_v = g.raio * T.FIDUCIAL_W_PX / T.FIDUCIAL_H_PX
+        pad_u = folga * g.du if g.n_colunas > 1 else 1.5 * g.raio
+        pad_v = folga * g.dv if g.n_linhas > 1 else 1.5 * raio_v
+        pad_u, pad_v = max(pad_u, g.raio * 1.02), max(pad_v, raio_v * 1.02)
+        u_min, u_max = g.u0 - pad_u, g.u0 + (g.n_colunas - 1) * g.du + pad_u
+        v_min, v_max = g.v0 - pad_v, g.v0 + (g.n_linhas - 1) * g.dv + pad_v
+        return (self.x0 + u_min * self.w, self.x0 + u_max * self.w,
+                self.y0 + v_min * self.h, self.y0 + v_max * self.h)
+
+    def bloco(self, bloco: T.Bloco, tol=30) -> dict:
+        xmin, xmax, ymin, ymax = self._caixa_do_bloco(bloco)
         c = self.circulos
         s = c[(c[:, 0] >= xmin) & (c[:, 0] <= xmax) & (c[:, 1] >= ymin) & (c[:, 1] <= ymax)]
         if len(s) == 0:
-            raise SystemExit(f"bloco {nome}: nenhum círculo na caixa {caixa}")
+            raise SystemExit(f"bloco {bloco.nome}: nenhum círculo onde o template espera")
         cx, cy = agrupar(s[:, 0], tol), agrupar(s[:, 1], tol)
         ax, bx, rx = ajustar(cx)
         ay, by, ry = ajustar(cy)
         return {
-            "nome": nome, "n": len(s), "colunas": len(cx), "linhas": len(cy),
+            "modelo": self.modelo, "fluxo": self.fluxo, "nome": bloco.nome,
+            "n": len(s), "colunas": len(cx), "linhas": len(cy),
             "u0": self.u(ax), "du": bx / self.w,
             "v0": self.v(ay), "dv": by / self.h,
             "raio": float(np.median(s[:, 2])) / self.w,
             "residuo_px": max(rx, ry),
+            "grade": bloco.grade,
         }
 
 
-CAIXAS_P1 = {
-    "numero_aluno": (1500, 2450, 480, 1200),
-    "linguagens_b1": (200, 650, 2350, 3450),
-    "linguagens_b2": (760, 1220, 2350, 3450),
-    "matematica_b1": (1390, 1840, 2350, 3450),
-    "matematica_b2": (1960, 2410, 2350, 3450),
-}
-CAIXAS_P2 = {
-    "numero_aluno": (1500, 2450, 480, 1200),
-    "correcao_g1": (500, 900, 3300, 3500),
-    "correcao_g2": (1240, 1620, 3300, 3500),
-    "correcao_g3": (1950, 2340, 3300, 3500),
-}
-
-# (bloco medido) -> (bloco do template). O template não tem um objeto por
-# medição, então comparamos com a Grade correspondente.
-GRADES_TEMPLATE = {
-    "numero_aluno": T.GRADE_NUMERO_ALUNO,
-    "linguagens_b1": T.LINGUAGENS_B1.grade,
-    "linguagens_b2": T.LINGUAGENS_B2.grade,
-    "matematica_b1": T.MATEMATICA_B1.grade,
-    "matematica_b2": T.MATEMATICA_B2.grade,
-    "correcao_g1": T.CORRECAO_G1.grade,
-    "correcao_g2": T.CORRECAO_G2.grade,
-    "correcao_g3": T.CORRECAO_G3.grade,
-}
-
-
-def medir_tudo() -> list[dict]:
+def medir_tudo(apenas: str | None = None) -> list[dict]:
+    """Mede todos os renders disponíveis. `apenas` filtra por modelo."""
     saida = []
-    for pagina, caixas in ((1, CAIXAS_P1), (2, CAIXAS_P2)):
-        med = Medidor(pagina)
-        print(f"\n### página {pagina} — quadro fiducial {med.w:.1f} x {med.h:.1f} px "
+    for (modelo, fluxo), nome in RENDERS.items():
+        if apenas and modelo != apenas:
+            continue
+        if not os.path.exists(os.path.join(MODELO, nome)):
+            print(f"\n### {modelo}/{fluxo}: render ausente ({nome}) — pulando")
+            continue
+        med = Medidor(modelo, fluxo)
+        folha = T.MODELOS[modelo].folhas[fluxo]
+        print(f"\n### {modelo}/{fluxo} — quadro fiducial {med.w:.1f} x {med.h:.1f} px "
               f"(aspecto {med.h / med.w:.6f}; template usa {T.ASPECTO:.6f})")
-        for nome, caixa in caixas.items():
-            b = med.bloco(nome, caixa)
-            b["pagina"] = pagina
+        for bloco in folha.blocos:
+            b = med.bloco(bloco)
             saida.append(b)
-            print(f"  {nome:15s} {b['linhas']:>2}x{b['colunas']:<2} bolhas={b['n']:>3}  "
+            print(f"  {bloco.nome:15s} {b['linhas']:>2}x{b['colunas']:<2} bolhas={b['n']:>3}  "
                   f"u0={b['u0']:.6f} du={b['du']:.6f}  v0={b['v0']:.6f} dv={b['dv']:.6f}  "
                   f"raio={b['raio']:.6f}  resíduo={b['residuo_px']:.2f}px")
     return saida
@@ -208,10 +246,13 @@ def conferir(medidos: list[dict], tol_px: float = 2.0) -> int:
     print(f"\n### conferência (tolerância {tol_px} px no canônico de "
           f"{T.FIDUCIAL_W_PX:.0f} px de largura)")
     ruins = 0
+    vistos = set()
     for b in medidos:
-        if b["pagina"] == 2 and b["nome"] == "numero_aluno":
-            continue                       # mesma grade da página 1
-        g = GRADES_TEMPLATE[b["nome"]]
+        chave = (b["modelo"], b["nome"])
+        if chave in vistos:
+            continue                       # o nº do aluno se repete entre páginas
+        vistos.add(chave)
+        g = b["grade"]
         difs = {
             "u0": (b["u0"] - g.u0) * T.FIDUCIAL_W_PX,
             "du": (b["du"] - g.du) * T.FIDUCIAL_W_PX,
@@ -226,7 +267,7 @@ def conferir(medidos: list[dict], tol_px: float = 2.0) -> int:
             ruins += 1
         detalhe = " ".join(f"{k}={v:+.2f}" for k, v in difs.items())
         forma = "" if forma_ok else f"  FORMA template={g.n_linhas}x{g.n_colunas}"
-        print(f"  {marca}{b['nome']:15s} pior={pior:5.2f}px  {detalhe}{forma}")
+        print(f"  {marca}{b['modelo']:14s} {b['nome']:15s} pior={pior:5.2f}px  {detalhe}{forma}")
     print("  => template em dia" if not ruins else f"  => {ruins} bloco(s) divergentes")
     return ruins
 
@@ -235,19 +276,27 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Calibra/confere o template da folha.")
     ap.add_argument("--render", action="store_true", help="rasteriza o PDF em samples/modelo/")
     ap.add_argument("--pdf", help="caminho do PDF oficial (com --render)")
+    ap.add_argument("--modelo", choices=sorted(T.MODELOS), default="anos_finais",
+                    help="qual modelo esse PDF é")
+    ap.add_argument("--fluxo", choices=("objetiva", "redacao"), default="objetiva",
+                    help="qual página do modelo")
+    ap.add_argument("--pagina", type=int, default=1,
+                    help="número da página dentro do PDF (1-based)")
+    ap.add_argument("--rotacao", type=int, default=0, choices=(0, 90, 180, 270),
+                    help="giro aplicado ANTES de medir (páginas vêm de cabeça para baixo)")
     ap.add_argument("--conferir", action="store_true",
-                    help="compara o medido com omr/template.py e sai != 0 se divergir")
+                    help="compara com omr/template.py e sai != 0 se divergir")
     args = ap.parse_args()
 
     if args.render:
         if not args.pdf:
             raise SystemExit("--render precisa de --pdf CAMINHO")
-        renderizar(args.pdf)
+        renderizar(args.pdf, args.modelo, args.fluxo, args.pagina, args.rotacao)
 
-    medidos = medir_tudo()
+    medidos = medir_tudo(args.modelo if args.render else None)
+    ruins = conferir(medidos)
     if args.conferir:
-        sys.exit(1 if conferir(medidos) else 0)
-    conferir(medidos)
+        sys.exit(1 if ruins else 0)
 
 
 if __name__ == "__main__":

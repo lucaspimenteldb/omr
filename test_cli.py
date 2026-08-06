@@ -8,8 +8,11 @@ Lê fotos de gabarito direto do disco, sem subir a API.
     python test_cli.py foto.jpg --json             # JSON bruto (scripts / conferência)
 
 Fluxos:
-    objetiva  -> página 1: nº do aluno + Linguagens (1..25) e Matemática (1..26)
-    redacao   -> página 2: nº do aluno + quadro de correção do professor
+    objetiva  -> respostas: nº do aluno + Linguagens e Matemática
+    redacao   -> redação:   nº do aluno + quadro de correção do professor
+
+O MODELO da folha (Anos Iniciais x Anos Finais) é reconhecido sozinho e sai no
+cabeçalho de cada leitura.
 """
 import argparse
 import json
@@ -43,9 +46,12 @@ def _imprimir_numero(num: dict) -> None:
 
 def imprimir(nome: str, res: dict) -> None:
     a = res["alignment"]
-    print(f"\n=== {nome} — fluxo {res['flow']} ===")
+    print(f"\n=== {nome} — fluxo {res['flow']} | modelo {res['model']} ===")
     print(f"registro: {a['fiducials']} | cobertura {a['coverage']:.0%} | "
           f"rotação {a['rotation']}° | ajuste {a['global_fit']}")
+    md = a.get("model_detection", {})
+    if md:
+        print(f"modelo: {md['linhas_detectadas']} linhas de questão, custos {md['custos']}")
     _imprimir_numero(res["student_number"])
 
     if res["flow"] == "objetiva":

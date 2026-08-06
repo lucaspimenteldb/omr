@@ -16,14 +16,19 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+from dataclasses import dataclass
+
 from . import config as C
 from . import template as T
-from .engine import LeituraFolha, ResultadoBloco, ResultadoCampo, ler_folha, sondar_objetiva
+from .engine import (
+    LINHAS_MIN_OBJETIVA, LeituraFolha, ResultadoBloco, ResultadoCampo,
+    identificar_modelo, ler_folha,
+)
 from .registration import (
     CANTOS_CANONICOS, ROTACOES, EntradaInvalida, OMRError, Registro, registrar,
 )
 
-__all__ = ["ler_objetiva", "ler_redacao", "ler_fluxo", "FLUXOS", "OMRError"]
+__all__ = ["ler_objetiva", "ler_redacao", "ler_fluxo", "FLUXOS", "OMRError", "Contexto"]
 
 # Cobertura = fração das bolhas do template encontradas na foto.
 COBERTURA_ORIENTACAO = 0.55       # abaixo disso, procura outra orientação
@@ -34,80 +39,109 @@ COBERTURA_MINIMA = 0.30           # abaixo disso, desiste: o registro não fecha
 # --------------------------------------------------------------------------- #
 # Registro + leitura, procurando a orientação certa
 # --------------------------------------------------------------------------- #
-def _tentar(image_bgr: np.ndarray, folha: T.Folha, rotacao: int):
-    """Tenta uma orientação. Devolve (None, None) se ela não fechar.
+@dataclass
+class Contexto:
+    """Tudo que a leitura de uma foto produziu, antes de virar JSON."""
 
-    `EntradaInvalida` passa direto: se a imagem em si não serve, girar não vai
-    ajudar e a mensagem específica é mais útil que a genérica do fim da busca.
+    registro: Registro
+    leitura: LeituraFolha
+    rotacao: int
+    modelo: T.Modelo
+    folha: T.Folha
+    diagnostico_modelo: dict
+
+
+def _parece_outra_pagina(fluxo: str, linhas: int) -> bool:
+    """As linhas de bolha vistas apontam para a OUTRA página deste modelo?
+
+    A objetiva tem dezenas de linhas de questão; a de redação tem só as duas do
+    quadro de correção. Quando o registro não fecha, essa contagem costuma ser
+    a explicação real — e "você trocou o endpoint" ajuda muito mais do que
+    "não consegui alinhar".
     """
-    try:
-        reg = registrar(image_bgr, rotacao=rotacao)
-        return reg, ler_folha(reg.canonica, folha)
-    except EntradaInvalida:
-        raise
-    except OMRError:
-        return None, None
+    if fluxo == "redacao":
+        return linhas >= LINHAS_MIN_OBJETIVA
+    return 0 < linhas < LINHAS_MIN_OBJETIVA
 
 
-def _registrar_e_ler(image_bgr: np.ndarray, folha: T.Folha) -> tuple[Registro, LeituraFolha, int]:
-    """Lê a folha, descobrindo sozinho se a foto está deitada ou de ponta-cabeça.
+def _erro_pagina_trocada(fluxo: str, linhas: int) -> OMRError:
+    if fluxo == "objetiva":
+        return OMRError(
+            "Esta foto não parece um CARTÃO-RESPOSTA: não achei os blocos de "
+            "questões de nenhum modelo (Anos Iniciais ou Anos Finais). Se for a "
+            "folha de PRODUÇÃO DE TEXTO, use o endpoint /omr/redacao."
+        )
+    return OMRError(
+        f"Esta foto parece um CARTÃO-RESPOSTA (achei {linhas} linhas de questões). "
+        "Para ler as respostas objetivas use o endpoint /omr/objetiva."
+    )
 
-    A orientação certa é a que reconhece mais bolhas do template — por isso a
-    escolha é pela `cobertura`, e não por heurística de formato da imagem. O
-    caminho normal (foto em pé) custa uma tentativa só: as outras três
+
+def _registrar_e_ler(image_bgr: np.ndarray, fluxo: str) -> Contexto:
+    """Lê a foto descobrindo sozinha a orientação E o modelo de folha.
+
+    Duas incógnitas são resolvidas antes de medir qualquer resposta:
+
+    - **orientação**: a folha pode vir em pé, deitada ou de ponta-cabeça. A
+      certa é a que reconhece mais bolhas do template (`cobertura`);
+    - **modelo**: Anos Iniciais e Anos Finais são a mesma folha com contagens
+      diferentes. Identificar errado NÃO falha ruidosamente — os dois têm o
+      mesmo passo entre linhas, então o template errado devolve respostas
+      deslocadas uma questão. Por isso o modelo é decidido pela geometria
+      medida das linhas (`identificar_modelo`), que separa os dois por uma
+      margem grande, e não pela cobertura, que os separa por pouco.
+
+    O caminho normal (foto em pé) custa uma tentativa; as outras três
     orientações só são testadas se a primeira não fechar.
     """
-    reg, leitura = _tentar(image_bgr, folha, 0)
-    rotacao = 0
+    melhor: Contexto | None = None
+    linhas_vistas = 0
 
-    if leitura is None or leitura.cobertura < COBERTURA_ORIENTACAO:
-        for outra in ROTACOES[1:]:
-            reg2, leitura2 = _tentar(image_bgr, folha, outra)
-            if leitura2 is None:
-                continue
-            if leitura is None or leitura2.cobertura > leitura.cobertura:
-                reg, leitura, rotacao = reg2, leitura2, outra
-            if leitura.cobertura >= COBERTURA_BOA:
-                break
+    for rotacao in ROTACOES:
+        try:
+            reg = registrar(image_bgr, rotacao=rotacao)
+        except EntradaInvalida:
+            raise
+        except OMRError:
+            continue
 
-    if leitura is None:
+        modelo, diag = identificar_modelo(reg.canonica, fluxo)
+        linhas_vistas = max(linhas_vistas, diag["linhas_detectadas"])
+        if modelo is None:
+            continue
+
+        folha = modelo.folhas[fluxo]
+        try:
+            leitura = ler_folha(reg.canonica, folha)
+        except OMRError:
+            continue
+
+        if melhor is None or leitura.cobertura > melhor.leitura.cobertura:
+            melhor = Contexto(reg, leitura, rotacao, modelo, folha, diag)
+        if melhor.leitura.cobertura >= COBERTURA_BOA:
+            break
+
+    if melhor is None:
+        # ou não achamos a folha, ou achamos e ela não é a página deste fluxo
+        if linhas_vistas:
+            raise _erro_pagina_trocada(fluxo, linhas_vistas)
         raise OMRError(
-            "Não encontrei os marcadores fiduciais nem as bordas da folha em "
-            "nenhuma orientação. Fotografe a folha inteira, reta, bem iluminada "
-            "e sem cortar os quatro cantos."
+            "Não consegui identificar a folha em nenhuma orientação. Fotografe "
+            "a folha inteira, reta, bem iluminada e com os quatro marcadores "
+            "dos cantos visíveis."
         )
 
-    if leitura.cobertura < COBERTURA_MINIMA:
+    if melhor.leitura.cobertura < COBERTURA_MINIMA:
+        if _parece_outra_pagina(fluxo, linhas_vistas):
+            raise _erro_pagina_trocada(fluxo, linhas_vistas)
         raise OMRError(
             "Não consegui alinhar a grade de bolhas da folha "
-            f"(só {leitura.pares_globais} de {leitura.esperadas_globais} bolhas "
-            "foram reconhecidas). Fotografe a folha inteira, sem dobras nem "
-            "sombra forte, com os quatro marcadores dos cantos visíveis."
+            f"(só {melhor.leitura.pares_globais} de "
+            f"{melhor.leitura.esperadas_globais} bolhas foram reconhecidas). "
+            "Fotografe a folha inteira, sem dobras nem sombra forte, com os "
+            "quatro marcadores dos cantos visíveis."
         )
-    return reg, leitura, rotacao
-
-
-def _conferir_pagina(canon: np.ndarray, leitura: LeituraFolha, folha: T.Folha) -> None:
-    """Recusa a folha da outra página antes de devolver resultado nenhum."""
-    if folha is T.FOLHA_OBJETIVA:
-        bolhas = sum(
-            leitura.blocos[b.nome].pares
-            for b in (T.LINGUAGENS_B1, T.LINGUAGENS_B2, T.MATEMATICA_B1, T.MATEMATICA_B2)
-            if b.nome in leitura.blocos
-        )
-        if bolhas < C.PAGINA_MIN_BOLHAS_OBJETIVA:
-            raise OMRError(
-                "Esta foto não parece o CARTÃO-RESPOSTA (não achei os blocos de "
-                "Linguagens/Matemática). Se for a folha de PRODUÇÃO DE TEXTO, "
-                "use o endpoint /omr/redacao."
-            )
-    else:
-        if sondar_objetiva(canon) >= C.PAGINA_MIN_BOLHAS_OBJETIVA:
-            raise OMRError(
-                "Esta foto parece o CARTÃO-RESPOSTA (achei os blocos de "
-                "Linguagens/Matemática). Para ler as respostas objetivas use o "
-                "endpoint /omr/objetiva."
-            )
+    return melhor
 
 
 # --------------------------------------------------------------------------- #
@@ -181,12 +215,14 @@ def _resumo(campos: list[ResultadoCampo]) -> dict:
     }
 
 
-def _alinhamento_json(reg: Registro, leitura: LeituraFolha, rotacao: int) -> dict:
+def _alinhamento_json(ctx: Contexto) -> dict:
+    reg, leitura = ctx.registro, ctx.leitura
     return {
+        "model_detection": ctx.diagnostico_modelo,
         "fiducials": reg.origem_fiduciais,
         "fiducial_scores": reg.scores,
         "paper_detected": reg.papel_detectado,
-        "rotation": rotacao,
+        "rotation": ctx.rotacao,
         "global_fit": leitura.ajuste_global,
         "coverage": round(leitura.cobertura, 3),
         "blocks": {
@@ -200,16 +236,19 @@ def _alinhamento_json(reg: Registro, leitura: LeituraFolha, rotacao: int) -> dic
 # Fluxo 1 — objetiva
 # --------------------------------------------------------------------------- #
 def ler_objetiva(image_bgr: np.ndarray, debug: bool = False):
-    """Lê a página 1: número do aluno + respostas de Linguagens e Matemática."""
-    reg, leitura, rotacao = _registrar_e_ler(image_bgr, T.FOLHA_OBJETIVA)
-    _conferir_pagina(reg.canonica, leitura, T.FOLHA_OBJETIVA)
+    """Lê a página objetiva: número do aluno + respostas por disciplina.
+
+    Serve os dois modelos — Anos Iniciais (21 + 22 questões) e Anos Finais
+    (25 + 26) — descobrindo qual é pela geometria da folha.
+    """
+    ctx = _registrar_e_ler(image_bgr, "objetiva")
 
     secoes = []
     todas: list[ResultadoCampo] = []
-    for area, blocos in T.AREAS.items():
+    for area, blocos in ctx.folha.areas.items():
         campos: list[ResultadoCampo] = []
         for b in blocos:
-            campos.extend(leitura.blocos[b.nome].campos)
+            campos.extend(ctx.leitura.blocos[b.nome].campos)
         campos.sort(key=lambda c: int(c.chave))
         todas.extend(campos)
         secoes.append(
@@ -223,27 +262,28 @@ def ler_objetiva(image_bgr: np.ndarray, debug: bool = False):
 
     saida = {
         "flow": "objetiva",
-        "student_number": _numero_aluno_json(leitura.blocos[T.BLOCO_NUMERO_ALUNO.nome]),
+        "model": ctx.modelo.nome,
+        "model_title": ctx.modelo.titulo,
+        "student_number": _numero_aluno_json(ctx.leitura.blocos[T.BLOCO_NUMERO_ALUNO.nome]),
         "sections": secoes,
         "summary": _resumo(todas),
-        "alignment": _alinhamento_json(reg, leitura, rotacao),
+        "alignment": _alinhamento_json(ctx),
     }
     if debug:
-        return saida, desenhar_debug(image_bgr, reg, leitura)
+        return saida, desenhar_debug(image_bgr, ctx)
     return saida
 
 
 # --------------------------------------------------------------------------- #
-# Fluxo 2 — redação
+# Fluxo 2 — redação (só existe no modelo Anos Finais)
 # --------------------------------------------------------------------------- #
 def ler_redacao(image_bgr: np.ndarray, debug: bool = False):
-    """Lê a página 2: número do aluno + quadro de correção do professor."""
-    reg, leitura, rotacao = _registrar_e_ler(image_bgr, T.FOLHA_REDACAO)
-    _conferir_pagina(reg.canonica, leitura, T.FOLHA_REDACAO)
+    """Lê a página de produção de texto: número do aluno + quadro de correção."""
+    ctx = _registrar_e_ler(image_bgr, "redacao")
 
     por_chave: dict[str, ResultadoCampo] = {}
     for b in T.BLOCOS_CORRECAO:
-        for campo in leitura.blocos[b.nome].campos:
+        for campo in ctx.leitura.blocos[b.nome].campos:
             por_chave[campo.chave] = campo
 
     correcao = {}
@@ -257,13 +297,15 @@ def ler_redacao(image_bgr: np.ndarray, debug: bool = False):
     campos = [por_chave[k] for k in T.ORDEM_CORRECAO]
     saida = {
         "flow": "redacao",
-        "student_number": _numero_aluno_json(leitura.blocos[T.BLOCO_NUMERO_ALUNO.nome]),
+        "model": ctx.modelo.nome,
+        "model_title": ctx.modelo.titulo,
+        "student_number": _numero_aluno_json(ctx.leitura.blocos[T.BLOCO_NUMERO_ALUNO.nome]),
         "correction": correcao,
         "summary": _resumo(campos),
-        "alignment": _alinhamento_json(reg, leitura, rotacao),
+        "alignment": _alinhamento_json(ctx),
     }
     if debug:
-        return saida, desenhar_debug(image_bgr, reg, leitura)
+        return saida, desenhar_debug(image_bgr, ctx)
     return saida
 
 
@@ -295,12 +337,17 @@ def _poligono_original(reg: Registro, cx: float, cy: float, raio: float, lados: 
     return reg.para_original(pts).round().astype(np.int32)
 
 
-def desenhar_debug(image_bgr: np.ndarray, reg: Registro, leitura: LeituraFolha) -> np.ndarray:
+def desenhar_debug(image_bgr: np.ndarray, ctx: Contexto) -> np.ndarray:
     """Devolve a foto original com cada bolha lida marcada por cima.
 
     Verde cheio = considerada marcada; cinza = vazia; laranja = zona ambígua.
     Assim dá para ver, em uma olhada, se a grade caiu em cima das bolhas certas.
     """
+    reg = ctx.registro
+    # os blocos vêm da folha DETECTADA: os dois modelos usam os mesmos nomes de
+    # bloco com contagens diferentes, então buscar por nome global daria o
+    # template do modelo errado
+    por_nome = {b.nome: b for b in ctx.folha.blocos}
     img = image_bgr.copy() if image_bgr.ndim == 3 else cv2.cvtColor(image_bgr, cv2.COLOR_GRAY2BGR)
     escala = max(1.0, min(img.shape[:2]) / 900.0)
 
@@ -308,17 +355,18 @@ def desenhar_debug(image_bgr: np.ndarray, reg: Registro, leitura: LeituraFolha) 
     moldura = reg.para_original(CANTOS_CANONICOS).round().astype(np.int32)
     cv2.polylines(img, [moldura], True, (255, 0, 255), max(1, int(2 * escala)), cv2.LINE_AA)
 
-    for bloco in leitura.blocos.values():
-        tpl = next(b for b in T.FOLHAS["objetiva"].blocos + T.FOLHAS["redacao"].blocos
-                   if b.nome == bloco.nome)
+    for bloco in ctx.leitura.blocos.values():
+        tpl = por_nome[bloco.nome]
         for i, campo in enumerate(bloco.campos):
             rotulos = tpl.rotulos_de(i)
             for rot, (li, ci) in zip(rotulos, tpl.celulas_do_campo(i)):
                 cx, cy = bloco.centros[li, ci]
-                fill = campo.fills[rot]
-                if fill >= C.MARK_THRESHOLD:
+                # a cor segue a DECISÃO do motor, não o limiar absoluto: marca
+                # circulada aceita pela regra relativa tem que aparecer verde,
+                # senão a imagem de debug contradiz o JSON
+                if rot in campo.marcadas:
                     cor, esp = (0, 170, 0), max(2, int(3 * escala))
-                elif fill >= C.REVIEW_LOW:
+                elif campo.fills[rot] >= C.PISO_RELATIVO:
                     cor, esp = (0, 140, 255), max(2, int(3 * escala))
                 else:
                     cor, esp = (150, 150, 150), max(1, int(1 * escala))
