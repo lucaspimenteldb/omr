@@ -151,6 +151,14 @@ def test_upload_malformado_explica_o_que_fazer(jpegs):
     assert "form-data" in corpo["detail"] and "Content-Type" in corpo["detail"]
     assert corpo["parser"], "a mensagem crua do parser some do diagnóstico"
 
+    # sem isto o diagnóstico vira adivinhação sobre o cliente
+    recebido = corpo["recebido"]
+    assert recebido["comeca_com_boundary"] is False
+    assert recebido["primeiros_bytes_hex"], "o início do corpo não foi capturado"
+    assert "JFIF" in recebido["primeiros_bytes_texto"], \
+        "os bytes relatados não são os do arquivo que o cliente mandou cru"
+    assert recebido["content_type"].startswith("multipart/form-data")
+
 
 def test_multipart_sem_boundary():
     r = cliente.post("/omr/objetiva", content=b"--X\r\n\r\n",
