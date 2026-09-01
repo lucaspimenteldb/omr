@@ -49,7 +49,7 @@ def test_health():
 
 def test_objetiva_contrato(jpegs):
     jpeg, gab = jpegs["objetiva"]
-    r = _post("/omr/objetiva", jpeg)
+    r = _post("/anos-iniciais/omr/objetiva", jpeg)
     assert r.status_code == 200, r.text
     corpo = r.json()
 
@@ -69,7 +69,7 @@ def test_objetiva_contrato(jpegs):
 
 def test_redacao_contrato(jpegs):
     jpeg, gab = jpegs["redacao"]
-    r = _post("/omr/redacao", jpeg, nome="redacao.jpg")
+    r = _post("/anos-iniciais/omr/redacao", jpeg, nome="redacao.jpg")
     assert r.status_code == 200, r.text
     corpo = r.json()
 
@@ -91,7 +91,8 @@ def test_redacao_contrato(jpegs):
         assert corpo["correction"][chave]["value"] == esperado["value"]
 
 
-@pytest.mark.parametrize("rota", ["/omr/objetiva/debug", "/omr/redacao/debug"])
+@pytest.mark.parametrize(
+    "rota", ["/anos-iniciais/omr/objetiva/debug", "/anos-iniciais/omr/redacao/debug"])
 def test_debug_devolve_png(jpegs, rota):
     fluxo = "objetiva" if "objetiva" in rota else "redacao"
     r = _post(rota, jpegs[fluxo][0])
@@ -101,13 +102,13 @@ def test_debug_devolve_png(jpegs, rota):
 
 
 def test_folha_trocada_devolve_422_com_dica(jpegs):
-    r = _post("/omr/redacao", jpegs["objetiva"][0])
+    r = _post("/anos-iniciais/omr/redacao", jpegs["objetiva"][0])
     assert r.status_code == 422
-    assert "/omr/objetiva" in r.json()["detail"]
+    assert "/anos-iniciais/omr/objetiva" in r.json()["detail"]
 
-    r = _post("/omr/objetiva", jpegs["redacao"][0])
+    r = _post("/anos-iniciais/omr/objetiva", jpegs["redacao"][0])
     assert r.status_code == 422
-    assert "/omr/redacao" in r.json()["detail"]
+    assert "/anos-iniciais/omr/redacao" in r.json()["detail"]
 
 
 def test_upload_heic_do_iphone(jpegs):
@@ -127,7 +128,7 @@ def test_upload_heic_do_iphone(jpegs):
     heic = buf.getvalue()
     assert cv2.imdecode(np.frombuffer(heic, np.uint8), cv2.IMREAD_COLOR) is None
 
-    r = cliente.post("/omr/objetiva",
+    r = cliente.post("/anos-iniciais/omr/objetiva",
                      files={"file": ("IMG_4821.HEIC", heic, "image/heic")})
     assert r.status_code == 200, r.text
     corpo = r.json()
@@ -142,7 +143,7 @@ def test_upload_malformado_explica_o_que_fazer(jpegs):
     index 2", que não ajuda ninguém a montar a requisição direito.
     """
     r = cliente.post(
-        "/omr/objetiva",
+        "/anos-iniciais/omr/objetiva",
         content=jpegs["objetiva"][0],
         headers={"Content-Type": "multipart/form-data; boundary=------------------------12345"},
     )
@@ -161,7 +162,7 @@ def test_upload_malformado_explica_o_que_fazer(jpegs):
 
 
 def test_multipart_sem_boundary():
-    r = cliente.post("/omr/objetiva", content=b"--X\r\n\r\n",
+    r = cliente.post("/anos-iniciais/omr/objetiva", content=b"--X\r\n\r\n",
                      headers={"Content-Type": "multipart/form-data"})
     assert r.status_code == 400
     assert "boundary" in r.json()["parser"].lower()
@@ -169,23 +170,23 @@ def test_multipart_sem_boundary():
 
 def test_pdf_recebe_recado_especifico():
     """PDF é o engano mais comum depois do HEIC — o 422 tem que dizer o que fazer."""
-    r = _post("/omr/objetiva", b"%PDF-1.7\n" + b"\x00" * 300, nome="folha.pdf")
+    r = _post("/anos-iniciais/omr/objetiva", b"%PDF-1.7\n" + b"\x00" * 300, nome="folha.pdf")
     assert r.status_code == 422
     assert "PDF" in r.json()["detail"]
 
 
-@pytest.mark.parametrize("rota", ["/omr/objetiva", "/omr/redacao"])
+@pytest.mark.parametrize("rota", ["/anos-iniciais/omr/objetiva", "/anos-iniciais/omr/redacao"])
 def test_arquivo_vazio_e_invalido(rota):
     assert _post(rota, b"").status_code == 422
     assert _post(rota, b"nao sou uma imagem").status_code == 422
 
 
-@pytest.mark.parametrize("rota", ["/omr/objetiva", "/omr/redacao"])
+@pytest.mark.parametrize("rota", ["/anos-iniciais/omr/objetiva", "/anos-iniciais/omr/redacao"])
 def test_sem_arquivo_da_422(rota):
     assert cliente.post(rota).status_code == 422
 
 
 def test_rota_antiga_avisa_a_troca():
-    r = cliente.post("/omr", files={"file": ("x.jpg", b"x", "image/jpeg")})
+    r = cliente.post("/anos-iniciais/omr", files={"file": ("x.jpg", b"x", "image/jpeg")})
     assert r.status_code == 410
-    assert "/omr/objetiva" in r.json()["detail"]
+    assert "/anos-iniciais/omr/objetiva" in r.json()["detail"]

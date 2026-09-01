@@ -7,11 +7,11 @@ Subir:
 Dois fluxos, um por página da folha. Os dois recebem a FOLHA INTEIRA
 fotografada (campo `file`, multipart/form-data):
 
-    POST /omr/objetiva        respostas -> nº do aluno + Linguagens + Matemática
-    POST /omr/redacao         redação   -> nº do aluno + quadro de correção
-    POST /omr/<fluxo>/debug   o mesmo, devolvendo a imagem anotada (PNG)
-    GET  /health              status do serviço e os modelos suportados
-    GET  /docs                Swagger UI
+    POST /anos-iniciais/omr/objetiva        respostas -> nº do aluno + Linguagens + Matemática
+    POST /anos-iniciais/omr/redacao         redação   -> nº do aluno + quadro de correção
+    POST /anos-iniciais/omr/<fluxo>/debug   o mesmo, devolvendo a imagem anotada (PNG)
+    GET  /health                            status do serviço e os modelos suportados
+    GET  /docs                              Swagger UI
 
 Dois MODELOS de folha são atendidos e reconhecidos automaticamente:
 
@@ -36,6 +36,13 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from omr import OMRError, decodificar, ler_fluxo
 from omr import template as T
+
+#: Prefixo de todas as rotas de leitura deste serviço.
+#:
+#: Cada série de folha sobe no seu próprio serviço, e os dois convivem atrás do
+#: mesmo domínio: sem o prefixo, `/omr/objetiva` seria ambíguo entre eles. É por
+#: ele que o app escolhe para qual leitor mandar a foto (ver `modelos.ts`).
+PREFIXO = "/anos-iniciais"
 
 app = FastAPI(
     title="OMR Backend — Cartão-Resposta Veloz",
@@ -125,7 +132,7 @@ class EspiarInicioDoCorpo:
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope.get("type") != "http" or not scope.get("path", "").startswith("/omr"):
+        if scope.get("type") != "http" or not scope.get("path", "").startswith(PREFIXO):
             return await self.app(scope, receive, send)
 
         async def espiar():
@@ -151,7 +158,7 @@ async def _erro_de_upload(request: Request, exc: StarletteHTTPException):
     começa com o `--boundary` declarado no Content-Type. O `recebido` abaixo
     mostra o que veio de fato, que é o que identifica o cliente culpado.
     """
-    if exc.status_code == 400 and request.url.path.startswith("/omr"):
+    if exc.status_code == 400 and request.url.path.startswith(PREFIXO):
         inicio = request.scope.get("inicio_do_corpo", b"")
         return JSONResponse(
             status_code=400,
@@ -190,7 +197,10 @@ def health():
             }
             for m in T.MODELOS.values()
         },
-        "rotas": {"objetiva": "/omr/objetiva", "redacao": "/omr/redacao"},
+        "rotas": {
+            "objetiva": f"{PREFIXO}/omr/objetiva",
+            "redacao": f"{PREFIXO}/omr/redacao",
+        },
     }
 
 
@@ -198,7 +208,7 @@ def health():
 # Fluxo 1 — respostas objetivas (página 1)
 # --------------------------------------------------------------------------- #
 @app.post(
-    "/omr/objetiva",
+    f"{PREFIXO}/omr/objetiva",
     tags=["objetiva"],
     summary="Lê a página de respostas (qualquer modelo): nº do aluno + Linguagens e Matemática",
     responses={200: {"content": {"application/json": {"example": EXEMPLO_OBJETIVA}}}},
@@ -229,8 +239,8 @@ async def omr_objetiva(
     return {"filename": file.filename, **resultado}
 
 
-@app.post("/omr/objetiva/debug", tags=["objetiva"],
-          summary="Igual a /omr/objetiva, mas devolve a foto anotada (PNG)")
+@app.post(f"{PREFIXO}/omr/objetiva/debug", tags=["objetiva"],
+          summary=f"Igual a {PREFIXO}/omr/objetiva, mas devolve a foto anotada (PNG)")
 async def omr_objetiva_debug(file: UploadFile = File(...)):
     """Devolve a própria foto com cada bolha lida circulada — verde = marcada,
     cinza = vazia, laranja = ambígua, e a moldura magenta mostra onde o motor
@@ -243,7 +253,7 @@ async def omr_objetiva_debug(file: UploadFile = File(...)):
 # Fluxo 2 — correção da redação (página 2)
 # --------------------------------------------------------------------------- #
 @app.post(
-    "/omr/redacao",
+    f"{PREFIXO}/omr/redacao",
     tags=["redação"],
     summary="Lê a página de produção de texto: nº do aluno + quadro de correção",
     responses={200: {"content": {"application/json": {"example": EXEMPLO_REDACAO}}}},
@@ -265,8 +275,8 @@ async def omr_redacao(
     return {"filename": file.filename, **resultado}
 
 
-@app.post("/omr/redacao/debug", tags=["redação"],
-          summary="Igual a /omr/redacao, mas devolve a foto anotada (PNG)")
+@app.post(f"{PREFIXO}/omr/redacao/debug", tags=["redação"],
+          summary=f"Igual a {PREFIXO}/omr/redacao, mas devolve a foto anotada (PNG)")
 async def omr_redacao_debug(file: UploadFile = File(...)):
     """Foto anotada com as bolhas lidas do quadro de correção e do número do aluno."""
     _, imagem = await _processar("redacao", file, debug=True)
@@ -276,10 +286,11 @@ async def omr_redacao_debug(file: UploadFile = File(...)):
 # --------------------------------------------------------------------------- #
 # Rota antiga
 # --------------------------------------------------------------------------- #
-@app.post("/omr", tags=["serviço"], include_in_schema=False)
+@app.post(f"{PREFIXO}/omr", tags=["serviço"], include_in_schema=False)
 async def omr_legado(file: UploadFile = File(None)):
     raise HTTPException(
         status_code=410,
         detail="A rota /omr era do modelo antigo de folha (16 questões). "
-               "Use /omr/objetiva (respostas) ou /omr/redacao (correção da redação).",
+               f"Use {PREFIXO}/omr/objetiva (respostas) ou "
+               f"{PREFIXO}/omr/redacao (correção da redação).",
     )

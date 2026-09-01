@@ -8,8 +8,8 @@ folhas *Cartão-Resposta Veloz* (Editora Veloz).
 
 | Fluxo | Endpoint | O que devolve |
 |---|---|---|
-| Objetiva | `POST /omr/objetiva` | número do aluno + Linguagens + Matemática |
-| Redação | `POST /omr/redacao` | número do aluno + quadro de correção (situação + competências 01–05) |
+| Objetiva | `POST /anos-iniciais/omr/objetiva` | número do aluno + Linguagens + Matemática |
+| Redação | `POST /anos-iniciais/omr/redacao` | número do aluno + quadro de correção (situação + competências 01–05) |
 
 **Dois modelos de folha**, reconhecidos automaticamente — o modelo detectado
 volta no campo `model` da resposta:
@@ -86,15 +86,15 @@ python3.12 -m venv .venv
 | Método | Rota | Descrição |
 |---|---|---|
 | `GET` | `/health` | status do serviço e o que cada fluxo devolve |
-| `POST` | `/omr/objetiva` | foto da página 1 → JSON com nº do aluno e as respostas |
-| `POST` | `/omr/objetiva/debug` | o mesmo, devolvendo a **foto anotada** (PNG) |
-| `POST` | `/omr/redacao` | foto da página 2 → JSON com nº do aluno e a correção |
-| `POST` | `/omr/redacao/debug` | o mesmo, devolvendo a **foto anotada** (PNG) |
+| `POST` | `/anos-iniciais/omr/objetiva` | foto da página 1 → JSON com nº do aluno e as respostas |
+| `POST` | `/anos-iniciais/omr/objetiva/debug` | o mesmo, devolvendo a **foto anotada** (PNG) |
+| `POST` | `/anos-iniciais/omr/redacao` | foto da página 2 → JSON com nº do aluno e a correção |
+| `POST` | `/anos-iniciais/omr/redacao/debug` | o mesmo, devolvendo a **foto anotada** (PNG) |
 | `GET` | `/docs` | Swagger UI — dá para testar pelo navegador |
 
-No Postman: `POST http://localhost:8000/omr/objetiva` → aba **Body** →
+No Postman: `POST http://localhost:8000/anos-iniciais/omr/objetiva` → aba **Body** →
 **form-data** → key `file` (troque o tipo de **Text** para **File**) → escolha a
-foto → **Send**. Use a URL **sem barra no final**: `/omr/objetiva/` responde
+foto → **Send**. Use a URL **sem barra no final**: `/anos-iniciais/omr/objetiva/` responde
 `307` e nem todo cliente reenvia o corpo no redirect.
 
 > **Não defina o header `Content-Type` na mão.** Quem monta o `boundary` é o
@@ -118,7 +118,7 @@ que é exatamente o que o motor mede.
 PDF **não** é aceito (é documento, não imagem): exporte a página como foto. O
 `422` diz isso com todas as letras em vez do genérico "formato não suportado".
 
-### Resposta — `/omr/objetiva`
+### Resposta — `/anos-iniciais/omr/objetiva`
 
 ```jsonc
 {~
@@ -146,7 +146,7 @@ PDF **não** é aceito (é documento, não imagem): exporte a página como foto.
 }
 ```
 
-### Resposta — `/omr/redacao`
+### Resposta — `/anos-iniciais/omr/redacao`
 
 ```jsonc
 {

@@ -69,11 +69,11 @@ def _erro_pagina_trocada(fluxo: str, linhas: int) -> OMRError:
         return OMRError(
             "Esta foto não parece um CARTÃO-RESPOSTA: não achei os blocos de "
             "questões de nenhum modelo (Anos Iniciais ou Anos Finais). Se for a "
-            "folha de PRODUÇÃO DE TEXTO, use o endpoint /omr/redacao."
+            "folha de PRODUÇÃO DE TEXTO, use o endpoint /anos-iniciais/omr/redacao."
         )
     return OMRError(
         f"Esta foto parece um CARTÃO-RESPOSTA (achei {linhas} linhas de questões). "
-        "Para ler as respostas objetivas use o endpoint /omr/objetiva."
+        "Para ler as respostas objetivas use o endpoint /anos-iniciais/omr/objetiva."
     )
 
 
