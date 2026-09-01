@@ -8,8 +8,8 @@ seu endpoint, e cada um recebendo a **folha inteira** fotografada:
 
 | Fluxo | Endpoint | Página | O que devolve |
 |---|---|---|---|
-| Objetiva | `POST /omr/objetiva` | 1 — *CARTÃO-RESPOSTA* | número do aluno + Linguagens (1–25) + Matemática (1–26) |
-| Redação | `POST /omr/redacao` | 2 — *PRODUÇÃO DE TEXTO* | número do aluno + quadro de correção (situação + competências 01–05) |
+| Objetiva | `POST /anos-finais/omr/objetiva` | 1 — *CARTÃO-RESPOSTA* | número do aluno + Linguagens (1–25) + Matemática (1–26) |
+| Redação | `POST /anos-finais/omr/redacao` | 2 — *PRODUÇÃO DE TEXTO* | número do aluno + quadro de correção (situação + competências 01–05) |
 
 A perspectiva é corrigida pelos **4 marcadores fiduciais** impressos nos cantos
 da folha, então a foto pode estar torta, inclinada ou tirada de lado.
@@ -98,15 +98,15 @@ python3.12 -m venv .venv
 | Método | Rota | Descrição |
 |---|---|---|
 | `GET` | `/health` | status do serviço e o que cada fluxo devolve |
-| `POST` | `/omr/objetiva` | foto da página 1 → JSON com nº do aluno e as respostas |
-| `POST` | `/omr/objetiva/debug` | o mesmo, devolvendo a **foto anotada** (PNG) |
-| `POST` | `/omr/redacao` | foto da página 2 → JSON com nº do aluno e a correção |
-| `POST` | `/omr/redacao/debug` | o mesmo, devolvendo a **foto anotada** (PNG) |
+| `POST` | `/anos-finais/omr/objetiva` | foto da página 1 → JSON com nº do aluno e as respostas |
+| `POST` | `/anos-finais/omr/objetiva/debug` | o mesmo, devolvendo a **foto anotada** (PNG) |
+| `POST` | `/anos-finais/omr/redacao` | foto da página 2 → JSON com nº do aluno e a correção |
+| `POST` | `/anos-finais/omr/redacao/debug` | o mesmo, devolvendo a **foto anotada** (PNG) |
 | `GET` | `/docs` | Swagger UI — dá para testar pelo navegador |
 
-No Postman: `POST http://localhost:8000/omr/objetiva` → aba **Body** →
+No Postman: `POST http://localhost:8000/anos-finais/omr/objetiva` → aba **Body** →
 **form-data** → key `file` (troque o tipo de **Text** para **File**) → escolha a
-foto → **Send**. Use a URL **sem barra no final**: `/omr/objetiva/` responde
+foto → **Send**. Use a URL **sem barra no final**: `/anos-finais/omr/objetiva/` responde
 `307` e nem todo cliente reenvia o corpo no redirect.
 
 > **Não defina o header `Content-Type` na mão.** Quem monta o `boundary` é o
@@ -130,7 +130,7 @@ que é exatamente o que o motor mede.
 PDF **não** é aceito (é documento, não imagem): exporte a página como foto. O
 `422` diz isso com todas as letras em vez do genérico "formato não suportado".
 
-### Resposta — `/omr/objetiva`
+### Resposta — `/anos-finais/omr/objetiva`
 
 ```jsonc
 {~
@@ -156,7 +156,7 @@ PDF **não** é aceito (é documento, não imagem): exporte a página como foto.
 }
 ```
 
-### Resposta — `/omr/redacao`
+### Resposta — `/anos-finais/omr/redacao`
 
 ```jsonc
 {

@@ -99,14 +99,14 @@ def _conferir_pagina(canon: np.ndarray, leitura: LeituraFolha, folha: T.Folha) -
             raise OMRError(
                 "Esta foto não parece o CARTÃO-RESPOSTA (não achei os blocos de "
                 "Linguagens/Matemática). Se for a folha de PRODUÇÃO DE TEXTO, "
-                "use o endpoint /omr/redacao."
+                "use o endpoint /anos-finais/omr/redacao."
             )
     else:
         if sondar_objetiva(canon) >= C.PAGINA_MIN_BOLHAS_OBJETIVA:
             raise OMRError(
                 "Esta foto parece o CARTÃO-RESPOSTA (achei os blocos de "
                 "Linguagens/Matemática). Para ler as respostas objetivas use o "
-                "endpoint /omr/objetiva."
+                "endpoint /anos-finais/omr/objetiva."
             )
 
 
